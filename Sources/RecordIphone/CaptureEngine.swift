@@ -17,6 +17,10 @@ final class CaptureEngine: NSObject, ObservableObject {
 
     @Published var phones: [AVCaptureDevice] = []
     @Published var selectedPhone: AVCaptureDevice?
+    /// True once the phone session is actually wired up and running — not
+    /// just "a device is selected". Recording is blocked until this is true,
+    /// so a mid-reconnect race can't silently record nothing.
+    @Published var phoneReady = false
     @Published var phase: Phase = .idle
     @Published var errorMessage: String?
     @Published var monitorPhoneAudio = false {
@@ -57,6 +61,10 @@ final class CaptureEngine: NSObject, ObservableObject {
     private var finishedURLs: [URL] = []
     private var phoneFileURL: URL?
     private var cameraFileURL: URL?
+
+    // Bumped every time the phone session is torn down or rebuilt, so a
+    // reconfiguration that finishes late can't clobber a newer one's state.
+    private var phoneSessionGeneration = 0
 
     // MARK: - Setup
 
@@ -113,7 +121,10 @@ final class CaptureEngine: NSObject, ObservableObject {
         ).devices.filter { $0.hasMediaType(.muxed) }
 
         phones = found
-        if let current = selectedPhone, !found.contains(current) {
+        if let current = selectedPhone, !found.contains(where: { $0.uniqueID == current.uniqueID }) {
+            // The device we were using is really gone (unplugged, locked, or
+            // asleep) — not just re-enumerated. Tear down and wait; don't
+            // silently keep "recording" from a connection that no longer exists.
             selectedPhone = nil
             teardownPhoneSession()
         }
@@ -140,10 +151,15 @@ final class CaptureEngine: NSObject, ObservableObject {
 
     func select(phone: AVCaptureDevice) {
         selectedPhone = phone
+        phoneReady = false
+        phoneSessionGeneration += 1
+        let generation = phoneSessionGeneration
+
         sessionQueue.async { [self] in
             phoneSession.beginConfiguration()
             phoneSession.inputs.forEach { phoneSession.removeInput($0) }
             phoneSession.outputs.forEach { phoneSession.removeOutput($0) }
+            var opened = false
             do {
                 let input = try AVCaptureDeviceInput(device: phone)
                 if phoneSession.canAddInput(input) { phoneSession.addInput(input) }
@@ -153,6 +169,7 @@ final class CaptureEngine: NSObject, ObservableObject {
                 if phoneSession.canAddOutput(preview) {
                     phoneSession.addOutput(preview)
                     DispatchQueue.main.async {
+                        guard generation == self.phoneSessionGeneration else { return }
                         self.audioPreview = preview
                         preview.volume = self.monitorPhoneAudio ? 1.0 : 0.0
                     }
@@ -160,18 +177,26 @@ final class CaptureEngine: NSObject, ObservableObject {
                 frameTap.alwaysDiscardsLateVideoFrames = true
                 frameTap.setSampleBufferDelegate(self, queue: frameTapQueue)
                 if phoneSession.canAddOutput(frameTap) { phoneSession.addOutput(frameTap) }
+                opened = true
             } catch {
                 DispatchQueue.main.async {
+                    guard generation == self.phoneSessionGeneration else { return }
                     self.errorMessage = "Couldn't open \(phone.localizedName): \(error.localizedDescription)"
                 }
             }
             phoneSession.commitConfiguration()
             if !phoneSession.isRunning { phoneSession.startRunning() }
-            DispatchQueue.main.async { self.updatePhoneAspect() }
+            DispatchQueue.main.async {
+                guard generation == self.phoneSessionGeneration else { return }
+                self.updatePhoneAspect()
+                self.phoneReady = opened
+            }
         }
     }
 
     private func teardownPhoneSession() {
+        phoneReady = false
+        phoneSessionGeneration += 1
         sessionQueue.async { [self] in
             phoneSession.beginConfiguration()
             phoneSession.inputs.forEach { phoneSession.removeInput($0) }
@@ -208,7 +233,7 @@ final class CaptureEngine: NSObject, ObservableObject {
     // MARK: - Recording
 
     func startRecording() {
-        guard case .idle = phase, selectedPhone != nil else { return }
+        guard case .idle = phase, selectedPhone != nil, phoneReady else { return }
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd HH.mm.ss"
         let dir = FileManager.default
@@ -226,16 +251,43 @@ final class CaptureEngine: NSObject, ObservableObject {
         phoneFileURL = dir.appendingPathComponent("phone.mov")
         cameraFileURL = dir.appendingPathComponent("camera.mov")
 
+        let generation = phoneSessionGeneration
         phoneOutput.startRecording(to: phoneFileURL!, recordingDelegate: self)
         cameraOutput.startRecording(to: cameraFileURL!, recordingDelegate: self)
         phase = .recording(startedAt: .now)
+
+        // Belt-and-suspenders: if the phone's connection was quietly torn down
+        // right as we started (a reconnect/lock race), `startRecording` above
+        // is a silent no-op — no file, no delegate callback, ever. Catch that
+        // within a couple seconds instead of hanging at "Saving..." forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self, generation == self.phoneSessionGeneration,
+                  case .recording = self.phase, !self.phoneOutput.isRecording else { return }
+            self.errorMessage = "The connection to your iPhone dropped right as recording started. Nothing was saved for this take — reconnect it and try again."
+            self.cameraOutput.stopRecording()
+            self.phase = .idle
+        }
     }
 
     func stopRecording() {
         guard case .recording = phase else { return }
         phase = .exporting(progress: 0)
+        let phoneWasRecording = phoneOutput.isRecording
         phoneOutput.stopRecording()
         cameraOutput.stopRecording()
+
+        // Safety net: if a file never actually started recording (or a finish
+        // callback never arrives for any other reason), don't sit at
+        // "Saving..." forever — surface it after a generous grace period.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let self, case .exporting = self.phase, self.finishedURLs.count < 2 else { return }
+            self.phase = .idle
+            if phoneWasRecording {
+                self.errorMessage = "Saving got stuck and was cancelled. Your raw recordings are still on disk in ~/Movies/Record iPhone if you want to recover them by hand."
+            } else {
+                self.errorMessage = "The iPhone wasn't actually recording during this take (its connection had dropped), so there's no phone video to save. Your camera footage is still on disk in ~/Movies/Record iPhone."
+            }
+        }
     }
 
     private func exportIfBothFinished() {

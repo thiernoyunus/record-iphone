@@ -31,8 +31,10 @@ struct ContentView: View {
                              Color(red: bg.bottom.0, green: bg.bottom.1, blue: bg.bottom.2)],
                     startPoint: .top, endPoint: .bottom)
 
-                if engine.selectedPhone != nil {
+                if engine.selectedPhone != nil, engine.phoneReady {
                     devicePreview(in: geo.size)
+                } else if engine.selectedPhone != nil {
+                    reconnectingState
                 } else {
                     emptyState
                 }
@@ -64,6 +66,17 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: screenRadius))
         }
         .shadow(color: .black.opacity(0.5), radius: 24, y: 8)
+    }
+
+    private var reconnectingState: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+            Text("Reconnecting…")
+                .font(.title3.weight(.medium))
+                .foregroundStyle(.white)
+            Text("If your iPhone is locked, unlock it.")
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var emptyState: some View {
@@ -147,7 +160,7 @@ struct ContentView: View {
                 Image(systemName: "camera")
             }
             .keyboardShortcut("s")
-            .disabled(engine.selectedPhone == nil)
+            .disabled(!engine.phoneReady)
             .help("Save a high-resolution screenshot of the device screen")
 
             recordButton
@@ -181,7 +194,7 @@ struct ContentView: View {
                     .font(.body.weight(.semibold))
             }
             .keyboardShortcut("r")
-            .disabled(engine.selectedPhone == nil)
+            .disabled(!engine.phoneReady)
         case .recording(let startedAt):
             Button {
                 engine.stopRecording()
