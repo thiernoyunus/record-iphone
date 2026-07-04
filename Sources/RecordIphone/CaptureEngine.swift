@@ -304,6 +304,12 @@ final class CaptureEngine: NSObject, ObservableObject {
               phoneURL.lastPathComponent, cameraURL.lastPathComponent,
               CMTimeSubtract(camStart, phoneStart).seconds)
         lastExportProgressAt = .now
+
+        // Free the Mac's single hardware video encoder for the export. Leaving
+        // the live capture sessions running during a save starves the encoder
+        // and can hang the export outright. The preview is just a progress bar
+        // while saving anyway, so pausing costs nothing.
+        let resumeSessions = pauseCaptureForExport()
         let work = Task {
             do {
                 let out = try await Exporter.export(
@@ -329,6 +335,7 @@ final class CaptureEngine: NSObject, ObservableObject {
                     self.errorMessage = "Export failed: \(error.localizedDescription). The raw recordings are saved next to it."
                 }
             }
+            resumeSessions()
             self.phase = .idle
         }
 
@@ -345,6 +352,25 @@ final class CaptureEngine: NSObject, ObservableObject {
                     work.cancel()
                     return
                 }
+            }
+        }
+    }
+
+    /// Stops the live capture sessions and returns a closure that restarts the
+    /// ones that were actually running. Runs synchronously so the export starts
+    /// with the encoder already free.
+    private func pauseCaptureForExport() -> @Sendable () -> Void {
+        let phoneWasRunning = phoneSession.isRunning
+        let cameraWasRunning = cameraSession.isRunning
+        sessionQueue.sync {
+            if phoneWasRunning { phoneSession.stopRunning() }
+            if cameraWasRunning { cameraSession.stopRunning() }
+        }
+        return { [weak self] in
+            guard let self else { return }
+            self.sessionQueue.async {
+                if phoneWasRunning, !self.phoneSession.isRunning { self.phoneSession.startRunning() }
+                if cameraWasRunning, !self.cameraSession.isRunning { self.cameraSession.startRunning() }
             }
         }
     }

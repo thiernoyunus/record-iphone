@@ -72,8 +72,18 @@ enum Exporter {
         }
         let cameraVideo = try await addTrack(from: cameraAsset, type: .video,
                                              to: composition, at: cameraAt)
-        _ = try await addTrack(from: phoneAsset, type: .audio, to: composition, at: phoneAt)
-        _ = try await addTrack(from: cameraAsset, type: .audio, to: composition, at: cameraAt)
+
+        // Blend the phone's sound and the mic into ONE track. Adding them as
+        // two separate composition tracks produces a file with two parallel
+        // audio tracks — QuickTime mixes those on playback, but CapCut and many
+        // players see two tracks and play the wrong (silent) one.
+        let mixedAudio = phoneURL.deletingLastPathComponent().appendingPathComponent("mixed-audio.m4a")
+        let mixedURL = try await mixAudio(
+            sources: [(phoneAsset, phoneAt), (cameraAsset, cameraAt)], into: mixedAudio)
+        if let mixedURL {
+            _ = try await addTrack(from: AVURLAsset(url: mixedURL), type: .audio,
+                                   to: composition, at: .zero)
+        }
 
         let instruction = CanvasInstruction(
             timeRange: CMTimeRange(start: .zero, duration: try await composition.load(.duration)),
@@ -110,7 +120,76 @@ enum Exporter {
         }
         defer { progressWatcher.cancel() }
         try await session.export(to: outURL, as: .mp4)
+        try? FileManager.default.removeItem(
+            at: phoneURL.deletingLastPathComponent().appendingPathComponent("mixed-audio.m4a"))
         return outURL
+    }
+
+    /// Mixes several audio sources (each with its own start offset) down to a
+    /// single stereo AAC file. AVAssetReaderAudioMixOutput is the purpose-built
+    /// API for this — it handles differing sample rates and channel counts
+    /// (phone stereo 44.1k + mic mono) and sums them into one stream.
+    private static func mixAudio(sources: [(AVURLAsset, CMTime)],
+                                 into output: URL) async throws -> URL? {
+        let comp = AVMutableComposition()
+        var tracks: [AVMutableCompositionTrack] = []
+        for (asset, at) in sources {
+            guard let src = try await asset.loadTracks(withMediaType: .audio).first else { continue }
+            let range = try await src.load(.timeRange)
+            guard let t = comp.addMutableTrack(withMediaType: .audio,
+                                               preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
+            try t.insertTimeRange(range, of: src, at: at)
+            tracks.append(t)
+        }
+        guard !tracks.isEmpty else { return nil }
+
+        let reader = try AVAssetReader(asset: comp)
+        let mixOut = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+            AVSampleRateKey: 48000,
+            AVNumberOfChannelsKey: 2,
+        ])
+        // ponytail: summing two full-volume sources can clip; acceptable for
+        // now. Add per-source gain via AVAudioMix if users report distortion.
+        guard reader.canAdd(mixOut) else { throw ExportError.exportSetup }
+        reader.add(mixOut)
+
+        try? FileManager.default.removeItem(at: output)
+        let writer = try AVAssetWriter(url: output, fileType: .m4a)
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 48000,
+            AVNumberOfChannelsKey: 2,
+            AVEncoderBitRateKey: 128000,
+        ])
+        writer.add(input)
+
+        guard reader.startReading(), writer.startWriting() else {
+            throw ExportError.exportSetup
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        let queue = DispatchQueue(label: "audio.mix")
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            input.requestMediaDataWhenReady(on: queue) {
+                while input.isReadyForMoreMediaData {
+                    if let buf = mixOut.copyNextSampleBuffer() {
+                        input.append(buf)
+                    } else {
+                        input.markAsFinished()
+                        cont.resume()
+                        return
+                    }
+                }
+            }
+        }
+        await writer.finishWriting()
+        reader.cancelReading()
+        return writer.status == .completed ? output : nil
     }
 
     /// Rotation stored as track metadata (radians). The pixels themselves are
