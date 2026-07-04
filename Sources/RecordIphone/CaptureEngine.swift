@@ -57,6 +57,7 @@ final class CaptureEngine: NSObject, ObservableObject {
     let latestFrame = FrameStore()
 
     // Per-recording bookkeeping (touched from delegate callbacks).
+    private var lastExportProgressAt = Date.now
     private var startTimes: [URL: CMTime] = [:]
     private var finishedURLs: [URL] = []
     private var phoneFileURL: URL?
@@ -299,20 +300,52 @@ final class CaptureEngine: NSObject, ObservableObject {
         let layout = ExportLayout(bubbleCenter: bubbleCenter, bubbleFraction: bubbleFraction,
                                   canvas: canvas.size, background: background,
                                   showBezel: showBezel)
-        Task {
+        NSLog("[export] starting: phone=%@ camera=%@ offset=%.3fs",
+              phoneURL.lastPathComponent, cameraURL.lastPathComponent,
+              CMTimeSubtract(camStart, phoneStart).seconds)
+        lastExportProgressAt = .now
+        let work = Task {
             do {
                 let out = try await Exporter.export(
                     phoneURL: phoneURL, cameraURL: cameraURL,
                     cameraOffset: CMTimeSubtract(camStart, phoneStart),
                     layout: layout,
                     onProgress: { p in
-                        Task { @MainActor in self.phase = .exporting(progress: p) }
+                        Task { @MainActor in
+                            self.phase = .exporting(progress: p)
+                            self.lastExportProgressAt = .now
+                        }
                     })
+                NSLog("[export] finished OK: %@", out.path)
                 NSWorkspace.shared.activateFileViewerSelecting([out])
             } catch {
-                self.errorMessage = "Export failed: \(error.localizedDescription). The raw recordings are saved next to it."
+                // AVFoundation may surface our watchdog's cancel as its own
+                // "cancelled" error rather than CancellationError.
+                if error is CancellationError || Task.isCancelled {
+                    NSLog("[export] cancelled by watchdog")
+                    self.errorMessage = "Saving stalled and was stopped. Your raw recordings are safe in the same folder — the video can be rebuilt from them."
+                } else {
+                    NSLog("[export] FAILED: %@", String(describing: error))
+                    self.errorMessage = "Export failed: \(error.localizedDescription). The raw recordings are saved next to it."
+                }
             }
             self.phase = .idle
+        }
+
+        // Watchdog: a healthy export reports progress every ~0.3s. If nothing
+        // moves for 60s the export is dead (we've seen AVFoundation die
+        // without ever throwing) — cancel it and tell the truth instead of
+        // showing "Saving…" forever.
+        Task {
+            while case .exporting = self.phase {
+                try? await Task.sleep(for: .seconds(10))
+                guard case .exporting = self.phase else { return }
+                if Date.now.timeIntervalSince(self.lastExportProgressAt) > 60 {
+                    NSLog("[export] watchdog: no progress for 60s, cancelling")
+                    work.cancel()
+                    return
+                }
+            }
         }
     }
 

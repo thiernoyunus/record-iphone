@@ -89,6 +89,9 @@ enum Exporter {
         videoComposition.frameDuration = CMTime(value: 1, timescale: 60)
         videoComposition.instructions = [instruction]
 
+        NSLog("[export] composition ready: duration=%.2fs canvas=%.0fx%.0f",
+              instruction.timeRange.duration.seconds, layout.canvas.width, layout.canvas.height)
+
         guard let session = AVAssetExportSession(
             asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
             throw ExportError.exportSetup
