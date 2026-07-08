@@ -48,6 +48,27 @@ enum CanvasPreset: String, CaseIterable, Identifiable {
     }
 }
 
+/// A Screen-Studio-style zoom: over its time range the whole canvas smoothly
+/// scales up around `center`, holds, and eases back out.
+struct ZoomSegment: Codable, Identifiable, Equatable, Sendable {
+    var id = UUID()
+    var start: Double            // seconds on the recording timeline
+    var duration: Double
+    var center = CGPoint(x: 0.5, y: 0.5)   // normalized canvas, top-left origin
+    var level: CGFloat = 2.0     // 1.0 = no zoom
+
+    var end: Double { start + duration }
+
+    /// Eased scale at time `t`: ramps in, holds, ramps out.
+    func scale(at t: Double) -> CGFloat {
+        guard t >= start, t <= end, level > 1 else { return 1 }
+        let ramp = min(0.6, duration / 3)
+        let k = min(1, min((t - start) / ramp, (end - t) / ramp))
+        let eased = k * k * (3 - 2 * k)   // smoothstep
+        return 1 + (level - 1) * eased
+    }
+}
+
 /// Combines phone.mov (screen video + device audio) and camera.mov (camera +
 /// mic) into one polished MP4: gradient background, rounded phone in the
 /// middle, rounded camera bubble where the user dragged it. Audio tracks are
@@ -56,6 +77,7 @@ enum Exporter {
 
     static func export(phoneURL: URL, cameraURL: URL,
                        cameraOffset: CMTime, layout: ExportLayout,
+                       zooms: [ZoomSegment] = [], trim: CMTimeRange? = nil,
                        onProgress: @escaping @Sendable (Double) -> Void = { _ in }) async throws -> URL {
         let phoneAsset = AVURLAsset(url: phoneURL)
         let cameraAsset = AVURLAsset(url: cameraURL)
@@ -85,28 +107,24 @@ enum Exporter {
                                    to: composition, at: .zero)
         }
 
-        let instruction = CanvasInstruction(
-            timeRange: CMTimeRange(start: .zero, duration: try await composition.load(.duration)),
+        let videoComposition = makeVideoComposition(
+            duration: try await composition.load(.duration),
             phoneTrackID: phoneVideo.trackID,
             cameraTrackID: cameraVideo?.trackID ?? kCMPersistentTrackID_Invalid,
             phoneRotation: try await rotationAngle(of: phoneAsset),
             cameraRotation: try await rotationAngle(of: cameraAsset),
-            layout: layout)
+            layout: layout, zooms: zooms)
 
-        let videoComposition = AVMutableVideoComposition()
-        videoComposition.customVideoCompositorClass = CanvasCompositor.self
-        videoComposition.renderSize = layout.canvas
-        videoComposition.frameDuration = CMTime(value: 1, timescale: 60)
-        videoComposition.instructions = [instruction]
-
-        NSLog("[export] composition ready: duration=%.2fs canvas=%.0fx%.0f",
-              instruction.timeRange.duration.seconds, layout.canvas.width, layout.canvas.height)
+        NSLog("[export] composition ready: duration=%.2fs canvas=%.0fx%.0f zooms=%d trimmed=%d",
+              try await composition.load(.duration).seconds,
+              layout.canvas.width, layout.canvas.height, zooms.count, trim != nil ? 1 : 0)
 
         guard let session = AVAssetExportSession(
             asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
             throw ExportError.exportSetup
         }
         session.videoComposition = videoComposition
+        if let trim { session.timeRange = trim }
 
         let outURL = phoneURL.deletingLastPathComponent().appendingPathComponent("Recording.mp4")
         try? FileManager.default.removeItem(at: outURL)
@@ -123,6 +141,68 @@ enum Exporter {
         try? FileManager.default.removeItem(
             at: phoneURL.deletingLastPathComponent().appendingPathComponent("mixed-audio.m4a"))
         return outURL
+    }
+
+    /// Everything the editor needs to drive an AVPlayer with the same look the
+    /// export will have.
+    struct Preview {
+        let composition: AVMutableComposition
+        let phoneTrackID: CMPersistentTrackID
+        let cameraTrackID: CMPersistentTrackID
+        let phoneRotation: CGFloat
+        let cameraRotation: CGFloat
+        let duration: Double
+    }
+
+    /// Builds a playable composition of the raw recordings for the editor.
+    /// Audio tracks are added raw (AVPlayer mixes them fine on playback; the
+    /// single-track blend only matters for the exported file).
+    static func makePreview(phoneURL: URL, cameraURL: URL,
+                            cameraOffset: CMTime) async throws -> Preview {
+        let phoneAsset = AVURLAsset(url: phoneURL)
+        let cameraAsset = AVURLAsset(url: cameraURL)
+        let phoneAt = cameraOffset.seconds < 0 ? (CMTime.zero - cameraOffset) : .zero
+        let cameraAt = cameraOffset.seconds > 0 ? cameraOffset : .zero
+
+        let composition = AVMutableComposition()
+        guard let phoneVideo = try await addTrack(from: phoneAsset, type: .video,
+                                                  to: composition, at: phoneAt) else {
+            throw ExportError.missingTrack("the iPhone recording has no video")
+        }
+        let cameraVideo = try await addTrack(from: cameraAsset, type: .video,
+                                             to: composition, at: cameraAt)
+        _ = try await addTrack(from: phoneAsset, type: .audio, to: composition, at: phoneAt)
+        _ = try await addTrack(from: cameraAsset, type: .audio, to: composition, at: cameraAt)
+
+        return Preview(
+            composition: composition,
+            phoneTrackID: phoneVideo.trackID,
+            cameraTrackID: cameraVideo?.trackID ?? kCMPersistentTrackID_Invalid,
+            phoneRotation: try await rotationAngle(of: phoneAsset),
+            cameraRotation: try await rotationAngle(of: cameraAsset),
+            duration: try await composition.load(.duration).seconds)
+    }
+
+    /// One instruction covering the whole timeline, rendered by our compositor.
+    /// Used identically by the editor's player and the exporter, so what you
+    /// see is exactly what you get.
+    static func makeVideoComposition(duration: CMTime,
+                                     phoneTrackID: CMPersistentTrackID,
+                                     cameraTrackID: CMPersistentTrackID,
+                                     phoneRotation: CGFloat, cameraRotation: CGFloat,
+                                     layout: ExportLayout,
+                                     zooms: [ZoomSegment]) -> AVMutableVideoComposition {
+        let instruction = CanvasInstruction(
+            timeRange: CMTimeRange(start: .zero, duration: duration),
+            phoneTrackID: phoneTrackID, cameraTrackID: cameraTrackID,
+            phoneRotation: phoneRotation, cameraRotation: cameraRotation,
+            layout: layout, zooms: zooms)
+        let vc = AVMutableVideoComposition()
+        vc.customVideoCompositorClass = CanvasCompositor.self
+        vc.renderSize = layout.canvas
+        vc.frameDuration = CMTime(value: 1, timescale: 60)
+        vc.instructions = [instruction]
+        return vc
     }
 
     /// Mixes several audio sources (each with its own start offset) down to a
@@ -237,16 +317,19 @@ final class CanvasInstruction: NSObject, AVVideoCompositionInstructionProtocol {
     let phoneRotation: CGFloat
     let cameraRotation: CGFloat
     let layout: ExportLayout
+    let zooms: [ZoomSegment]
 
     init(timeRange: CMTimeRange, phoneTrackID: CMPersistentTrackID,
          cameraTrackID: CMPersistentTrackID,
-         phoneRotation: CGFloat, cameraRotation: CGFloat, layout: ExportLayout) {
+         phoneRotation: CGFloat, cameraRotation: CGFloat, layout: ExportLayout,
+         zooms: [ZoomSegment] = []) {
         self.timeRange = timeRange
         self.phoneTrackID = phoneTrackID
         self.cameraTrackID = cameraTrackID
         self.phoneRotation = phoneRotation
         self.cameraRotation = cameraRotation
         self.layout = layout
+        self.zooms = zooms
         var ids = [NSNumber(value: phoneTrackID)]
         if cameraTrackID != kCMPersistentTrackID_Invalid {
             ids.append(NSNumber(value: cameraTrackID))
@@ -295,6 +378,22 @@ final class CanvasCompositor: NSObject, AVVideoCompositing {
            let camBuffer = request.sourceFrame(byTrackID: instruction.cameraTrackID) {
             let cam = upright(CIImage(cvPixelBuffer: camBuffer), angle: instruction.cameraRotation)
             frame = place(bubble: cam, on: frame, canvas: size, layout: instruction.layout)
+        }
+
+        // Screen-Studio-style zoom: scale the whole composed canvas around the
+        // segment's focus point, eased in and out. Applied last so background,
+        // bezel, and bubble all zoom together like a camera push-in.
+        let t = request.compositionTime.seconds
+        if let z = instruction.zooms.first(where: { t >= $0.start && t <= $0.end }) {
+            let s = z.scale(at: t)
+            if s > 1.001 {
+                let cx = z.center.x * size.width
+                let cy = (1 - z.center.y) * size.height   // flip UI y → CI y
+                frame = frame.transformed(by:
+                    CGAffineTransform(translationX: -cx, y: -cy)
+                        .concatenating(CGAffineTransform(scaleX: s, y: s))
+                        .concatenating(CGAffineTransform(translationX: cx, y: cy)))
+            }
         }
 
         Self.context.render(frame.cropped(to: CGRect(origin: .zero, size: size)),

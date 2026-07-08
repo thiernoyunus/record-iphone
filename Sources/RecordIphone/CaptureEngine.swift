@@ -22,6 +22,7 @@ final class CaptureEngine: NSObject, ObservableObject {
     /// so a mid-reconnect race can't silently record nothing.
     @Published var phoneReady = false
     @Published var phase: Phase = .idle
+    @Published var editor: EditorState?
     @Published var errorMessage: String?
     @Published var monitorPhoneAudio = false {
         didSet { audioPreview?.volume = monitorPhoneAudio ? 1.0 : 0.0 }
@@ -291,69 +292,29 @@ final class CaptureEngine: NSObject, ObservableObject {
         }
     }
 
-    private func exportIfBothFinished() {
+    func currentLayout() -> ExportLayout {
+        ExportLayout(bubbleCenter: bubbleCenter, bubbleFraction: bubbleFraction,
+                     canvas: canvas.size, background: background, showBezel: showBezel)
+    }
+
+    /// Both raw files are closed — open the editor instead of exporting right
+    /// away. Live capture pauses while editing (frees the hardware encoder for
+    /// playback/export); it resumes when the editor closes.
+    private func openEditorIfBothFinished() {
         guard finishedURLs.count == 2,
               let phoneURL = phoneFileURL, let cameraURL = cameraFileURL else { return }
-        // Align the two files: whichever started later gets shifted by the gap.
         let phoneStart = startTimes[phoneURL] ?? .zero
         let camStart = startTimes[cameraURL] ?? .zero
-        let layout = ExportLayout(bubbleCenter: bubbleCenter, bubbleFraction: bubbleFraction,
-                                  canvas: canvas.size, background: background,
-                                  showBezel: showBezel)
-        NSLog("[export] starting: phone=%@ camera=%@ offset=%.3fs",
+        NSLog("[editor] opening: phone=%@ camera=%@ offset=%.3fs",
               phoneURL.lastPathComponent, cameraURL.lastPathComponent,
               CMTimeSubtract(camStart, phoneStart).seconds)
-        lastExportProgressAt = .now
-
-        // Free the Mac's single hardware video encoder for the export. Leaving
-        // the live capture sessions running during a save starves the encoder
-        // and can hang the export outright. The preview is just a progress bar
-        // while saving anyway, so pausing costs nothing.
+        phase = .idle
         let resumeSessions = pauseCaptureForExport()
-        let work = Task {
-            do {
-                let out = try await Exporter.export(
-                    phoneURL: phoneURL, cameraURL: cameraURL,
-                    cameraOffset: CMTimeSubtract(camStart, phoneStart),
-                    layout: layout,
-                    onProgress: { p in
-                        Task { @MainActor in
-                            self.phase = .exporting(progress: p)
-                            self.lastExportProgressAt = .now
-                        }
-                    })
-                NSLog("[export] finished OK: %@", out.path)
-                NSWorkspace.shared.activateFileViewerSelecting([out])
-            } catch {
-                // AVFoundation may surface our watchdog's cancel as its own
-                // "cancelled" error rather than CancellationError.
-                if error is CancellationError || Task.isCancelled {
-                    NSLog("[export] cancelled by watchdog")
-                    self.errorMessage = "Saving stalled and was stopped. Your raw recordings are safe in the same folder — the video can be rebuilt from them."
-                } else {
-                    NSLog("[export] FAILED: %@", String(describing: error))
-                    self.errorMessage = "Export failed: \(error.localizedDescription). The raw recordings are saved next to it."
-                }
-            }
-            resumeSessions()
-            self.phase = .idle
-        }
-
-        // Watchdog: a healthy export reports progress every ~0.3s. If nothing
-        // moves for 60s the export is dead (we've seen AVFoundation die
-        // without ever throwing) — cancel it and tell the truth instead of
-        // showing "Saving…" forever.
-        Task {
-            while case .exporting = self.phase {
-                try? await Task.sleep(for: .seconds(10))
-                guard case .exporting = self.phase else { return }
-                if Date.now.timeIntervalSince(self.lastExportProgressAt) > 60 {
-                    NSLog("[export] watchdog: no progress for 60s, cancelling")
-                    work.cancel()
-                    return
-                }
-            }
-        }
+        editor = EditorState(
+            dir: phoneURL.deletingLastPathComponent(),
+            phoneURL: phoneURL, cameraURL: cameraURL,
+            cameraOffset: CMTimeSubtract(camStart, phoneStart),
+            engine: self, onClose: resumeSessions)
     }
 
     /// Stops the live capture sessions and returns a closure that restarts the
@@ -444,7 +405,7 @@ extension CaptureEngine: AVCaptureFileOutputRecordingDelegate {
                 return
             }
             self.finishedURLs.append(outputFileURL)
-            self.exportIfBothFinished()
+            self.openEditorIfBothFinished()
         }
     }
 }

@@ -5,9 +5,15 @@ struct ContentView: View {
     @EnvironmentObject var engine: CaptureEngine
 
     var body: some View {
-        VStack(spacing: 0) {
-            canvas
-            controls
+        Group {
+            if let editor = engine.editor {
+                EditorView(editor: editor)
+            } else {
+                VStack(spacing: 0) {
+                    canvas
+                    controls
+                }
+            }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .alert("Something went wrong", isPresented: .init(
@@ -207,10 +213,10 @@ struct ContentView: View {
                 .font(.body.weight(.semibold))
             }
             .keyboardShortcut("r")
-        case .exporting(let progress):
+        case .exporting:
             HStack(spacing: 8) {
-                ProgressView(value: progress).frame(width: 120)
-                Text("Saving… \(Int(progress * 100))%").monospacedDigit()
+                ProgressView().controlSize(.small)
+                Text("Finishing…")
             }
         }
     }

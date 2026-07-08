@@ -89,14 +89,16 @@ one take, with clean audio from both sources.
       true-size/pixel-perfect zoom.
 
 ### Phase 3 — Editor + export (the Screen Studio look)
-- Switch recording to raw tracks (phone video, phone audio, camera, mic) with
-  synced timestamps + a project file; effects become non-destructive.
-- Timeline: trim/cut, manual zoom-and-pan keyframes with smooth animated
-  easing (this is the manual version of Screen Studio's signature move).
-- Camera bubble layouts (corner bubble, side-by-side), background swap in post.
-- Audio: volume normalization, background-noise removal (Apple's built-in
-  voice isolation where available).
-- Export presets: MP4/GIF, 4K/60, vertical for socials, web-friendly sizes.
+- [x] Stopping a recording opens an editor instead of instantly exporting;
+      edits live in project.json next to the raw files (non-destructive).
+- [x] Live styled playback via the same compositor as the export (WYSIWYG).
+- [x] Timeline: film-strip thumbnails, draggable playhead, trim handles.
+- [x] Zoom segments: drop at playhead, drag chip to move / grip to resize,
+      aim with a reticle on the preview, eased in/out (verified on export).
+- [x] Look controls (background, bezel, bubble size) still editable in post.
+- [ ] Deferred: cut (remove middle sections), side-by-side camera layout,
+      voice isolation / volume normalization, GIF + 4K export presets,
+      reopening old recordings from a browser (project.json already supports it).
 
 ### Phase 4 — Wireless + moonshots
 - AirPlay receiver for cable-free mirroring, built on UxPlay/RPiPlay (GPLv3 —
