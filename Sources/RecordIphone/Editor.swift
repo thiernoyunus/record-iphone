@@ -2,6 +2,32 @@ import AVFoundation
 import AppKit
 import SwiftUI
 
+/// Thread-safe accumulator for a worker process's line-based stdout.
+final class WorkerOutput: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer = ""
+    private var finalResult: String?
+
+    /// Appends a chunk and returns any newly completed lines.
+    func completeLines(appending chunk: String) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        buffer += chunk
+        var lines = buffer.components(separatedBy: "\n")
+        buffer = lines.removeLast()   // keep the unterminated tail
+        return lines.filter { !$0.isEmpty }
+    }
+
+    func setResult(_ line: String) {
+        lock.lock(); defer { lock.unlock() }
+        finalResult = line
+    }
+
+    func result() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return finalResult
+    }
+}
+
 /// Drives the post-recording editor: a live styled preview (same compositor as
 /// the export), trim, zoom segments, thumbnails, and the final export. Edits
 /// persist to project.json next to the raw recordings, so nothing is baked in
@@ -111,17 +137,24 @@ final class EditorState: ObservableObject {
             layout: engine.currentLayout(), zooms: zooms)
     }
 
-    /// Re-renders the preview after any look/zoom change. Cheap — it swaps
-    /// instruction metadata, not media.
+    /// Re-renders the preview after a look/zoom change — debounced. Reticle
+    /// and slider drags fire per mouse-move; swapping the player's video
+    /// composition hundreds of times a second wedges AVFoundation's pipeline
+    /// (audio drops out, later exports stall), so changes settle for 140ms
+    /// before one swap is applied.
+    private var refreshTask: Task<Void, Never>?
     func refreshPreview() {
-        guard player.currentItem != nil else { return }
-        player.currentItem?.videoComposition = currentVideoComposition()
-        if !isPlaying {
-            // Nudge the paused frame so the change shows immediately.
-            player.seek(to: CMTime(seconds: currentTime, preferredTimescale: 600),
-                        toleranceBefore: .zero, toleranceAfter: .zero)
+        refreshTask?.cancel()
+        refreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(140))
+            guard let self, !Task.isCancelled, self.player.currentItem != nil else { return }
+            self.player.currentItem?.videoComposition = self.currentVideoComposition()
+            if !self.isPlaying {
+                // Nudge the paused frame so the change shows immediately.
+                self.seek(to: self.currentTime)
+            }
+            self.save()
         }
-        save()
     }
 
     // MARK: - Transport
@@ -209,65 +242,103 @@ final class EditorState: ObservableObject {
 
     // MARK: - Export & close
 
+    /// Exports run in a separate worker process (a headless copy of this app
+    /// binary running --export-json). The editor's preview pipeline has wedged
+    /// AVFoundation before — a clean process is immune to all of that, and a
+    /// stall is fixed by killing the worker, never the app.
     func export() {
-        guard exportProgress == nil, let _ = preview else { return }
+        guard exportProgress == nil, preview != nil else { return }
         player.pause()
-        // Fully disconnect the preview player while exporting so its media
-        // pipeline can't compete with (or poison) the export's.
-        let parkedItem = player.currentItem
-        player.replaceCurrentItem(with: nil)
         exportProgress = 0
         lastExportProgressAt = .now
-        let trim: CMTimeRange? = (trimStart > 0.05 || trimEnd < duration - 0.05)
-            ? CMTimeRange(start: CMTime(seconds: trimStart, preferredTimescale: 600),
-                          end: CMTime(seconds: trimEnd, preferredTimescale: 600))
-            : nil
         save()
 
-        let work = Task {
-            do {
-                let out = try await Exporter.export(
-                    phoneURL: phoneURL, cameraURL: cameraURL, cameraOffset: cameraOffset,
-                    layout: engine.currentLayout(), zooms: zooms, trim: trim,
-                    onProgress: { p in
-                        Task { @MainActor in
-                            self.exportProgress = p
-                            self.lastExportProgressAt = .now
-                        }
-                    })
-                NSLog("[export] editor export OK: %@", out.path)
-                NSWorkspace.shared.activateFileViewerSelecting([out])
-            } catch {
-                if error is CancellationError || Task.isCancelled {
-                    self.engine.errorMessage = "Saving stalled and was stopped. Your raw recordings and edits are safe — try Export again."
-                } else {
-                    NSLog("[export] editor export FAILED: %@", String(describing: error))
-                    self.engine.errorMessage = "Export failed: \(error.localizedDescription). Your raw recordings and edits are safe."
-                }
-            }
-            // Reconnect the preview and put the frame back where it was.
-            self.player.replaceCurrentItem(with: parkedItem)
-            self.applyTrimToPlayback()
-            self.seek(to: self.currentTime)
-            self.exportProgress = nil
+        let spec = ExportSpec(
+            phonePath: phoneURL.path, cameraPath: cameraURL.path,
+            cameraOffsetSeconds: cameraOffset.seconds,
+            layout: engine.currentLayout(), zooms: zooms,
+            trimStart: trimStart > 0.05 ? trimStart : nil,
+            trimEnd: trimEnd < duration - 0.05 ? trimEnd : nil)
+        let specURL = dir.appendingPathComponent("export-spec.json")
+        guard let specData = try? JSONEncoder().encode(spec),
+              (try? specData.write(to: specURL)) != nil,
+              let exe = Bundle.main.executableURL else {
+            engine.errorMessage = "Couldn't start the export."
+            exportProgress = nil
+            return
         }
 
-        // Same watchdog as before: a healthy export reports progress
-        // constantly; a minute of silence means it's dead.
-        Task {
-            while self.exportProgress != nil {
+        let worker = Process()
+        worker.executableURL = exe
+        worker.arguments = ["--export-json", specURL.path]
+        let pipe = Pipe()
+        worker.standardOutput = pipe
+        let output = WorkerOutput()
+
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = String(decoding: handle.availableData, as: UTF8.self)
+            for line in output.completeLines(appending: chunk) {
+                if line.hasPrefix("progress "), let p = Double(line.dropFirst(9)) {
+                    Task { @MainActor [weak self] in
+                        self?.exportProgress = p
+                        self?.lastExportProgressAt = .now
+                    }
+                } else if line.hasPrefix("OK ") || line.hasPrefix("FAIL") {
+                    output.setResult(line)
+                }
+            }
+        }
+        worker.terminationHandler = { proc in
+            let status = proc.terminationStatus
+            let result = output.result()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                pipe.fileHandleForReading.readabilityHandler = nil
+                try? FileManager.default.removeItem(at: specURL)
+                if status == 0, let result, result.hasPrefix("OK ") {
+                    NSLog("[export] worker OK: %@", result)
+                    let out = self.dir.appendingPathComponent("Recording.mp4")
+                    NSWorkspace.shared.activateFileViewerSelecting([out])
+                } else if self.exportWatchdogKilled {
+                    self.engine.errorMessage = "Saving stalled and was stopped. Your raw recordings and edits are safe — try Export again."
+                } else {
+                    NSLog("[export] worker FAILED status=%d result=%@", status, result ?? "none")
+                    self.engine.errorMessage = "Export failed. Your raw recordings and edits are safe — try Export again."
+                }
+                self.exportWatchdogKilled = false
+                self.exportProgress = nil
+            }
+        }
+
+        do {
+            try worker.run()
+            NSLog("[export] worker started pid=%d", worker.processIdentifier)
+        } catch {
+            engine.errorMessage = "Couldn't start the export: \(error.localizedDescription)"
+            exportProgress = nil
+            return
+        }
+
+        // Watchdog: a healthy worker prints progress ~3×/sec. A minute of
+        // silence means it's dead — kill it and say so.
+        Task { [weak self] in
+            while let self, self.exportProgress != nil {
                 try? await Task.sleep(for: .seconds(10))
-                guard self.exportProgress != nil else { return }
+                guard let s = self.exportProgress, s < 1 else { continue }
                 if Date.now.timeIntervalSince(self.lastExportProgressAt) > 60 {
-                    NSLog("[export] editor watchdog: no progress for 60s, cancelling")
-                    work.cancel()
+                    NSLog("[export] watchdog: worker silent for 60s, terminating")
+                    self.exportWatchdogKilled = true
+                    worker.terminate()
                     return
                 }
             }
         }
     }
 
+    private var exportWatchdogKilled = false
+
     func close() {
+        refreshTask?.cancel()
         save()
         player.pause()
         player.replaceCurrentItem(with: nil)

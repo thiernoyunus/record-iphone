@@ -2,9 +2,22 @@ import AVFoundation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
+/// Everything a headless export run needs, written as JSON next to the
+/// recording. Exports run in a separate worker process (spawned copy of this
+/// app) so nothing the editor's preview pipeline has done can stall them.
+struct ExportSpec: Codable {
+    var phonePath: String
+    var cameraPath: String
+    var cameraOffsetSeconds: Double
+    var layout: ExportLayout
+    var zooms: [ZoomSegment]
+    var trimStart: Double?
+    var trimEnd: Double?
+}
+
 /// Look settings shared by the live preview and the export, in normalized
 /// units so they map from the on-screen canvas to the export canvas.
-struct ExportLayout {
+struct ExportLayout: Codable {
     var bubbleCenter: CGPoint     // 0...1, top-left origin (SwiftUI style)
     var bubbleFraction: CGFloat   // bubble side / min canvas dimension
     var canvas: CGSize
@@ -15,7 +28,7 @@ struct ExportLayout {
     static let bezelColor: (CGFloat, CGFloat, CGFloat) = (0.07, 0.07, 0.08)
 }
 
-enum BackgroundPreset: String, CaseIterable, Identifiable {
+enum BackgroundPreset: String, CaseIterable, Identifiable, Codable {
     case midnight = "Midnight"
     case graphite = "Graphite"
     case ocean = "Ocean"
@@ -124,7 +137,16 @@ enum Exporter {
             throw ExportError.exportSetup
         }
         session.videoComposition = videoComposition
-        if let trim { session.timeRange = trim }
+        if let trim {
+            // Clamp to the composition — the editor measures duration off the
+            // preview composition, which can run a hair longer than this one.
+            // A timeRange past the real end makes the exporter wait forever
+            // for frames that never come (hangs at 0%).
+            let total = try await composition.load(.duration)
+            let end = CMTimeMinimum(trim.end, total)
+            let start = CMTimeClampToRange(trim.start, range: CMTimeRange(start: .zero, end: end))
+            session.timeRange = CMTimeRange(start: start, end: end)
+        }
 
         let outURL = phoneURL.deletingLastPathComponent().appendingPathComponent("Recording.mp4")
         try? FileManager.default.removeItem(at: outURL)
