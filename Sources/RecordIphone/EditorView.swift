@@ -137,6 +137,16 @@ struct EditorView: View {
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
 
+            Button {
+                editor.reloadPreview()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .keyboardShortcut("r")
+            .help("Reload the preview (⌘R) — fixes playback if the sound drops out")
+
             Spacer()
 
             if let zoom = editor.selectedZoom {

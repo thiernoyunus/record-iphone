@@ -67,6 +67,7 @@ final class EditorState: ObservableObject {
     /// makes AVFoundation silently render black and stall exports at 0%.
     private var compositionDuration: CMTime = .zero
     private var timeObserver: Any?
+    private var stallObserver: NSObjectProtocol?
     private var lastExportProgressAt = Date.now
 
     var selectedZoom: ZoomSegment? {
@@ -120,6 +121,17 @@ final class EditorState: ObservableObject {
             item.videoComposition = currentVideoComposition()
             player.replaceCurrentItem(with: item)
             applyTrimToPlayback()
+
+            // Self-heal: if the playback pipeline stalls, rebuild it in place.
+            stallObserver = NotificationCenter.default.addObserver(
+                forName: AVPlayerItem.playbackStalledNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    NSLog("[editor] playback stalled — rebuilding player item")
+                    self?.reloadPreview()
+                }
+            }
             await makeThumbnails()
         } catch {
             loadFailed = "Couldn't open this recording for editing: \(error.localizedDescription)"
@@ -130,11 +142,32 @@ final class EditorState: ObservableObject {
 
     private func currentVideoComposition() -> AVMutableVideoComposition {
         guard let preview else { return AVMutableVideoComposition() }
-        return Exporter.makeVideoComposition(
+        let layout = engine.currentLayout()
+        let vc = Exporter.makeVideoComposition(
             duration: compositionDuration,
             phoneTrackID: preview.phoneTrackID, cameraTrackID: preview.cameraTrackID,
             phoneRotation: preview.phoneRotation, cameraRotation: preview.cameraRotation,
-            layout: engine.currentLayout(), zooms: zooms)
+            layout: layout, zooms: zooms)
+        // Preview-only: half resolution, 30fps. Visually identical at window
+        // size but 4-8× cheaper — a live pipeline that falls behind is what
+        // makes playback audio drop out. Exports render full quality.
+        vc.renderSize = CGSize(width: layout.canvas.width / 2, height: layout.canvas.height / 2)
+        vc.frameDuration = CMTime(value: 1, timescale: 30)
+        return vc
+    }
+
+    /// Rebuilds the player item from scratch at the current position. Recovers
+    /// a wedged playback pipeline (e.g. audio that has gone silent).
+    func reloadPreview() {
+        guard let preview else { return }
+        let t = currentTime
+        let wasPlaying = isPlaying
+        let item = AVPlayerItem(asset: preview.composition)
+        item.videoComposition = currentVideoComposition()
+        player.replaceCurrentItem(with: item)
+        applyTrimToPlayback()
+        seek(to: t)
+        if wasPlaying { player.play() }
     }
 
     /// Re-renders the preview after a look/zoom change — debounced. Reticle
@@ -339,6 +372,7 @@ final class EditorState: ObservableObject {
 
     func close() {
         refreshTask?.cancel()
+        if let stallObserver { NotificationCenter.default.removeObserver(stallObserver) }
         save()
         player.pause()
         player.replaceCurrentItem(with: nil)
