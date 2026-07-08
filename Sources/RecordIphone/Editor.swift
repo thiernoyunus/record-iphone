@@ -132,6 +132,7 @@ final class EditorState: ObservableObject {
     }
 
     func seek(to seconds: Double) {
+        guard seconds.isFinite else { return }
         let clamped = min(max(seconds, 0), duration)
         currentTime = clamped
         player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600),
@@ -147,7 +148,7 @@ final class EditorState: ObservableObject {
     // MARK: - Zooms
 
     func addZoom() {
-        var z = ZoomSegment(start: min(currentTime, duration - 2), duration: 3)
+        var z = ZoomSegment(start: max(0, min(currentTime, duration - 2)), duration: 3)
         z.duration = min(3, duration - z.start)
         zooms.append(z)
         zooms.sort { $0.start < $1.start }

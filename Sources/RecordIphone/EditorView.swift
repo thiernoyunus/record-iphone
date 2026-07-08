@@ -198,6 +198,7 @@ private struct TimelineStrip: View {
     @ObservedObject var editor: EditorState
     @State private var dragBaseStart: [UUID: Double] = [:]
     @State private var dragBaseDuration: [UUID: Double] = [:]
+    @State private var trimBase: [String: Double] = [:]
 
     var body: some View {
         GeometryReader { geo in
@@ -232,13 +233,16 @@ private struct TimelineStrip: View {
                     zoomChip(zoom, pps: pps, height: geo.size.height)
                 }
 
-                // Trim handles
-                trimHandle(x: editor.trimStart * pps, height: geo.size.height) { x in
-                    editor.trimStart = min(max(0, x / pps), editor.trimEnd - 1)
+                // Trim handles — drag by relative motion (the handle's own
+                // coordinate space is only 7pt wide, so absolute positions lie)
+                trimHandle(x: editor.trimStart * pps, height: geo.size.height,
+                           key: "start", current: editor.trimStart, pps: pps) { seconds in
+                    editor.trimStart = min(max(0, seconds), editor.trimEnd - 1)
                     editor.applyTrimToPlayback()
                 }
-                trimHandle(x: editor.trimEnd * pps, height: geo.size.height) { x in
-                    editor.trimEnd = max(min(editor.duration, x / pps), editor.trimStart + 1)
+                trimHandle(x: editor.trimEnd * pps, height: geo.size.height,
+                           key: "end", current: editor.trimEnd, pps: pps) { seconds in
+                    editor.trimEnd = max(min(editor.duration, seconds), editor.trimStart + 1)
                     editor.applyTrimToPlayback()
                 }
 
@@ -300,14 +304,20 @@ private struct TimelineStrip: View {
         .help("Drag to move the zoom; drag the grip to change its length")
     }
 
-    private func trimHandle(x: CGFloat, height: CGFloat,
-                            onDrag: @escaping (CGFloat) -> Void) -> some View {
+    private func trimHandle(x: CGFloat, height: CGFloat, key: String,
+                            current: Double, pps: CGFloat,
+                            onDrag: @escaping (Double) -> Void) -> some View {
         RoundedRectangle(cornerRadius: 3)
             .fill(.white)
             .frame(width: 7, height: height + 6)
             .overlay(RoundedRectangle(cornerRadius: 1).fill(.black.opacity(0.35)).frame(width: 1.5, height: 18))
             .offset(x: x - 3.5, y: -3)
-            .gesture(DragGesture(minimumDistance: 1).onChanged { onDrag($0.location.x) })
+            .gesture(DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if trimBase[key] == nil { trimBase[key] = current }
+                    onDrag((trimBase[key] ?? current) + value.translation.width / pps)
+                }
+                .onEnded { _ in trimBase[key] = nil })
             .help("Drag to trim")
     }
 }
