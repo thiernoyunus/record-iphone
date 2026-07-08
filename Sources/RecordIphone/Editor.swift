@@ -35,6 +35,11 @@ final class EditorState: ObservableObject {
     @Published var loadFailed: String?
 
     private var preview: Exporter.Preview?
+    /// Exact composition duration. The video-composition instruction must
+    /// cover the timeline EXACTLY — rebuilding this CMTime from a Double
+    /// loses precision, and a coverage gap of even a fraction of a frame
+    /// makes AVFoundation silently render black and stall exports at 0%.
+    private var compositionDuration: CMTime = .zero
     private var timeObserver: Any?
     private var lastExportProgressAt = Date.now
 
@@ -73,6 +78,7 @@ final class EditorState: ObservableObject {
             let preview = try await Exporter.makePreview(
                 phoneURL: phoneURL, cameraURL: cameraURL, cameraOffset: cameraOffset)
             self.preview = preview
+            compositionDuration = try await preview.composition.load(.duration)
             duration = max(preview.duration, 0.1)
             trimEnd = duration
 
@@ -99,7 +105,7 @@ final class EditorState: ObservableObject {
     private func currentVideoComposition() -> AVMutableVideoComposition {
         guard let preview else { return AVMutableVideoComposition() }
         return Exporter.makeVideoComposition(
-            duration: CMTime(seconds: duration, preferredTimescale: 600),
+            duration: compositionDuration,
             phoneTrackID: preview.phoneTrackID, cameraTrackID: preview.cameraTrackID,
             phoneRotation: preview.phoneRotation, cameraRotation: preview.cameraRotation,
             layout: engine.currentLayout(), zooms: zooms)
@@ -206,6 +212,10 @@ final class EditorState: ObservableObject {
     func export() {
         guard exportProgress == nil, let _ = preview else { return }
         player.pause()
+        // Fully disconnect the preview player while exporting so its media
+        // pipeline can't compete with (or poison) the export's.
+        let parkedItem = player.currentItem
+        player.replaceCurrentItem(with: nil)
         exportProgress = 0
         lastExportProgressAt = .now
         let trim: CMTimeRange? = (trimStart > 0.05 || trimEnd < duration - 0.05)
@@ -235,6 +245,10 @@ final class EditorState: ObservableObject {
                     self.engine.errorMessage = "Export failed: \(error.localizedDescription). Your raw recordings and edits are safe."
                 }
             }
+            // Reconnect the preview and put the frame back where it was.
+            self.player.replaceCurrentItem(with: parkedItem)
+            self.applyTrimToPlayback()
+            self.seek(to: self.currentTime)
             self.exportProgress = nil
         }
 
