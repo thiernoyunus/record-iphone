@@ -374,15 +374,11 @@ final class CanvasCompositor: NSObject, AVVideoCompositing {
             frame = place(phone: phone, on: frame, canvas: size,
                           showBezel: instruction.layout.showBezel)
         }
-        if instruction.cameraTrackID != kCMPersistentTrackID_Invalid,
-           let camBuffer = request.sourceFrame(byTrackID: instruction.cameraTrackID) {
-            let cam = upright(CIImage(cvPixelBuffer: camBuffer), angle: instruction.cameraRotation)
-            frame = place(bubble: cam, on: frame, canvas: size, layout: instruction.layout)
-        }
 
-        // Screen-Studio-style zoom: scale the whole composed canvas around the
-        // segment's focus point, eased in and out. Applied last so background,
-        // bezel, and bubble all zoom together like a camera push-in.
+        // Screen-Studio-style zoom: push into the screen content (background +
+        // phone) around the segment's focus point, eased in and out. Applied
+        // BEFORE the camera bubble is drawn, so the presenter stays visible
+        // and fixed in place while the screen zooms behind them.
         let t = request.compositionTime.seconds
         if let z = instruction.zooms.first(where: { t >= $0.start && t <= $0.end }) {
             let s = z.scale(at: t)
@@ -393,7 +389,14 @@ final class CanvasCompositor: NSObject, AVVideoCompositing {
                     CGAffineTransform(translationX: -cx, y: -cy)
                         .concatenating(CGAffineTransform(scaleX: s, y: s))
                         .concatenating(CGAffineTransform(translationX: cx, y: cy)))
+                    .cropped(to: CGRect(origin: .zero, size: size))
             }
+        }
+
+        if instruction.cameraTrackID != kCMPersistentTrackID_Invalid,
+           let camBuffer = request.sourceFrame(byTrackID: instruction.cameraTrackID) {
+            let cam = upright(CIImage(cvPixelBuffer: camBuffer), angle: instruction.cameraRotation)
+            frame = place(bubble: cam, on: frame, canvas: size, layout: instruction.layout)
         }
 
         Self.context.render(frame.cropped(to: CGRect(origin: .zero, size: size)),
