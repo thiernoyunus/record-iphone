@@ -101,12 +101,10 @@ one take, with clean audio from both sources.
       reopening old recordings from a browser (project.json already supports it).
 
 ### Phase 4 — Wireless + moonshots
-- AirPlay receiver for cable-free mirroring, built on UxPlay/RPiPlay (GPLv3 —
-  fine, the app is open source). Plan: adapt the protocol/decryption layer,
-  replace the GStreamer playback path with our native AVFoundation pipeline so
-  received frames flow into the same canvas/recorder as USB. Ship video first,
-  audio second (AirPlay audio is a separate encrypted stream), matching how
-  even Bezel staged it.
+- [x] AirPlay receiver for cable-free mirroring, built on UxPlay (GPLv3).
+      The helper advertises **Record iPhone** in Control Center → Screen
+      Mirroring. Frames decode in-app (not macOS full-screen). Video first;
+      AirPlay audio still deferred (same staging as Bezel 4.0).
 - Companion iOS app streaming touch coordinates → true tap-driven auto-zoom.
   Would be first-in-market.
 - iPad / Apple TV / Vision Pro sources (the USB trick already covers iPad).
