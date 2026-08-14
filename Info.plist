@@ -21,8 +21,15 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSCameraUsageDescription</key>
-    <string>Record iPhone shows and records your camera and your iPhone's screen.</string>
+    <string>The Mac camera is shown in a bubble next to the phone screen and can be saved into your recording.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Record iPhone records your voice along with your screen recording.</string>
+    <string>Your voice is recorded with the phone screen so the finished video has narration.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>This Mac can appear in Control Center → Screen Mirroring so you can send the phone picture over Wi‑Fi.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_airplay._tcp</string>
+        <string>_raop._tcp</string>
+    </array>
 </dict>
 </plist>
