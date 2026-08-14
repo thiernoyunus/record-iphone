@@ -235,26 +235,6 @@ struct ExportLayout: Codable, Equatable {
         )
     }
 
-    /// Where the phone sits in split layout (left half landscape, bottom half portrait).
-    static func splitPhoneZone(canvas: CGSize) -> CGRect {
-        splitZones(canvas: canvas, layout: ExportLayout(
-            bubbleCenter: .zero, bubbleFraction: 0.3, canvas: canvas,
-            background: .snow, showBezel: false)).phone
-    }
-
-    /// Where the presenter card sits in split layout (right half landscape, top half portrait).
-    static func splitCameraZone(canvas: CGSize) -> CGRect {
-        splitZones(canvas: canvas, layout: ExportLayout(
-            bubbleCenter: .zero, bubbleFraction: 0.3, canvas: canvas,
-            background: .snow, showBezel: false)).camera
-    }
-
-    /// Camera card side length in split layout for a given slider fraction.
-    static func splitCameraSide(canvas: CGSize, fraction: CGFloat) -> CGFloat {
-        let zone = splitCameraZone(canvas: canvas)
-        let maxSide = min(zone.width, zone.height) * 0.98
-        return min(maxSide, max(maxSide * 0.45, fraction * min(canvas.width, canvas.height) * 1.15))
-    }
 }
 
 enum BackgroundPreset: String, CaseIterable, Identifiable, Codable {
@@ -471,20 +451,19 @@ enum Exporter {
            await joinedPhoneAudioURL(in: readyPhone.deletingLastPathComponent()) != nil {
             hadAnyAudio = true
         }
-        guard hadAnyAudio else {
-            throw ExportError.missingTrack("the recording has no usable sound")
-        }
-        let phoneVol = Float(min(max(phoneAudioLevel, 0), 1))
-        let micVol = Float(min(max(micAudioLevel, 0), 1))
-        var leveled: [(AVURLAsset, CMTime, Float, CMTime)] = [(phoneAsset, phoneAt, phoneVol, phoneSkip)]
-        if let sidecar = await joinedPhoneAudioURL(in: readyPhone.deletingLastPathComponent()) {
-            leveled.append((AVURLAsset(url: sidecar), phoneAt, phoneVol, phoneSkip))
-        }
-        if let cameraAsset { leveled.append((cameraAsset, cameraAt, micVol, cameraSkip)) }
-        guard let mixedURL = try await mixAudio(sources: leveled, into: mixedAudio),
-              try await addTrack(from: AVURLAsset(url: mixedURL), type: .audio,
-                                 to: composition, at: .zero) != nil else {
-            throw ExportError.missingTrack("the recorded sound could not be prepared for export")
+        if hadAnyAudio {
+            let phoneVol = Float(min(max(phoneAudioLevel, 0), 1))
+            let micVol = Float(min(max(micAudioLevel, 0), 1))
+            var leveled: [(AVURLAsset, CMTime, Float, CMTime)] = [(phoneAsset, phoneAt, phoneVol, phoneSkip)]
+            if let sidecar = await joinedPhoneAudioURL(in: readyPhone.deletingLastPathComponent()) {
+                leveled.append((AVURLAsset(url: sidecar), phoneAt, phoneVol, phoneSkip))
+            }
+            if let cameraAsset { leveled.append((cameraAsset, cameraAt, micVol, cameraSkip)) }
+            guard let mixedURL = try await mixAudio(sources: leveled, into: mixedAudio),
+                  try await addTrack(from: AVURLAsset(url: mixedURL), type: .audio,
+                                     to: composition, at: .zero) != nil else {
+                throw ExportError.missingTrack("the recorded sound could not be prepared for export")
+            }
         }
 
         let phoneDur = (try? await phoneAsset.load(.duration).seconds) ?? 0
@@ -809,12 +788,14 @@ enum Exporter {
         let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
         guard let ffmpeg, urls.count > 1 else { return nil }
-        let list = dest.deletingLastPathComponent().appendingPathComponent("phone.concat.txt")
+        let list = dest.deletingLastPathComponent()
+            .appendingPathComponent("phone.concat-\(UUID().uuidString).txt")
         let body = urls.map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }
             .joined(separator: "\n")
         do {
             try body.write(to: list, atomically: true, encoding: .utf8)
         } catch { return nil }
+        defer { try? FileManager.default.removeItem(at: list) }
         try? FileManager.default.removeItem(at: dest)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: ffmpeg)
@@ -831,10 +812,8 @@ enum Exporter {
                 do { try proc.run() } catch { cont.resume(throwing: error) }
             }
         } catch {
-            try? FileManager.default.removeItem(at: list)
             return nil
         }
-        try? FileManager.default.removeItem(at: list)
         let size = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         return size > 1024 ? dest : nil
     }
@@ -1022,11 +1001,9 @@ enum Exporter {
                 while io.input.isReadyForMoreMediaData {
                     if let buf = io.output.copyNextSampleBuffer() {
                         if !sessionStarted {
-                            // AAC files often start at ~0.2s (encoder priming).
-                            // Map the first real sample to movie time 0 so the
-                            // first words are not a silent hole.
-                            let pts = CMSampleBufferGetPresentationTimeStamp(buf)
-                            writer.startSession(atSourceTime: pts.seconds.isFinite ? pts : .zero)
+                            // Video begins at phoneAt. Keep the mix writer at
+                            // zero so leading silence stays aligned with it.
+                            writer.startSession(atSourceTime: .zero)
                             sessionStarted = true
                         }
                         guard io.input.append(buf) else {

@@ -78,6 +78,7 @@ struct LookControls: View {
                                             in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel(Self.cameraPositionName(x: x, y: y))
                     }
                 }
 
@@ -416,10 +417,15 @@ struct LookControls: View {
     private func setBackground(_ rgb: (CGFloat, CGFloat, CGFloat)) {
         engine.customBackgroundRGB = [rgb.0, rgb.1, rgb.2]
         hexDraft = hexString(from: rgb)
-        if rgb.0 > 0.9 && rgb.1 > 0.9 && rgb.2 > 0.9 { engine.background = .snow }
-        else if rgb.0 < 0.1 && rgb.1 < 0.1 && rgb.2 < 0.1 { engine.background = .black }
-        else { engine.background = .snow }
+        let isNearBlack = rgb.0 < 0.1 && rgb.1 < 0.1 && rgb.2 < 0.1
+        engine.background = isNearBlack ? .black : .snow
         onChange()
+    }
+
+    private static func cameraPositionName(x: CGFloat, y: CGFloat) -> String {
+        let horizontal = x < 0.3 ? "left" : x > 0.7 ? "right" : "center"
+        let vertical = y < 0.3 ? "Top" : y > 0.7 ? "Bottom" : "Middle"
+        return "\(vertical) \(horizontal) camera position"
     }
 
     private func matchesBackground(_ rgb: (CGFloat, CGFloat, CGFloat)) -> Bool {

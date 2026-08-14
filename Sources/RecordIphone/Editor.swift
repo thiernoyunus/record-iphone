@@ -979,10 +979,12 @@ final class EditorState: ObservableObject {
                 guard let block = CMSampleBufferGetDataBuffer(buf) else { continue }
                 let t = CMSampleBufferGetPresentationTimeStamp(buf).seconds
                 let n = CMBlockBufferGetDataLength(block)
+                guard n >= 2 else { continue }
                 var data = [Int16](repeating: 0, count: n / 2)
-                _ = data.withUnsafeMutableBytes {
-                    CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: n,
-                                               destination: $0.baseAddress!)
+                data.withUnsafeMutableBytes { raw in
+                    guard let dest = raw.baseAddress else { return }
+                    _ = CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: n,
+                                                   destination: dest)
                 }
                 let bucket = min(buckets - 1, max(0, Int(t / total * Double(buckets))))
                 let peak = data.reduce(Int16(0)) { max($0, Swift.max($1, $1 == .min ? .max : -$1)) }
@@ -1099,6 +1101,8 @@ final class EditorState: ObservableObject {
         exportProgress = 0
         exportSucceeded = false
         exportedURL = nil
+        exportWatchdogKilled = false
+        exportUserCancelled = false
         lastExportProgressAt = .now
         save()
 
@@ -1134,6 +1138,12 @@ final class EditorState: ObservableObject {
         let output = WorkerOutput()
         exportWorker = worker
 
+        errPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            NSLog("[export] worker stderr: %@", String(decoding: data, as: UTF8.self))
+        }
+
         outPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
@@ -1154,6 +1164,7 @@ final class EditorState: ObservableObject {
             // Drain any remaining bytes so a trailing "OK …" without a flush
             // race isn't missed (the classic false "Export failed" bug).
             outPipe.fileHandleForReading.readabilityHandler = nil
+            errPipe.fileHandleForReading.readabilityHandler = nil
             if let leftover = try? outPipe.fileHandleForReading.readToEnd(), !leftover.isEmpty {
                 for line in output.completeLines(appending: String(decoding: leftover, as: UTF8.self)) {
                     if line.hasPrefix("OK ") || line.hasPrefix("FAIL") {
@@ -1170,7 +1181,9 @@ final class EditorState: ObservableObject {
                 try? FileManager.default.removeItem(at: specURL)
                 self.exportWorker = nil
 
-                if status == 0, let result, result.hasPrefix("OK ") {
+                if self.exportUserCancelled {
+                    self.exportProgress = nil
+                } else if status == 0, let result, result.hasPrefix("OK ") {
                     NSLog("[export] worker OK: %@", result)
                     self.exportProgress = 1
                     self.exportSucceeded = true
@@ -1191,6 +1204,7 @@ final class EditorState: ObservableObject {
                     self.exportProgress = nil
                 }
                 self.exportWatchdogKilled = false
+                self.exportUserCancelled = false
             }
         }
 
@@ -1222,11 +1236,12 @@ final class EditorState: ObservableObject {
 
     func cancelExport() {
         guard exportProgress != nil else { return }
-        exportWatchdogKilled = true
+        exportUserCancelled = true
         exportWorker?.terminate()
     }
 
     private var exportWatchdogKilled = false
+    private var exportUserCancelled = false
 
     func close() {
         refreshTask?.cancel()
@@ -1236,6 +1251,7 @@ final class EditorState: ObservableObject {
         }
         if let stallObserver { NotificationCenter.default.removeObserver(stallObserver) }
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        if let cameraEndObserver { NotificationCenter.default.removeObserver(cameraEndObserver) }
         statusObservation?.invalidate()
         save()
         player.pause()

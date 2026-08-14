@@ -119,8 +119,9 @@ final class PhoneSampleWriter: @unchecked Sendable {
         lock.lock()
         guard armed else { lock.unlock(); return }
         if let size = Self.videoSize(from: sample), videoStarted,
-           videoSize.width > 8, abs(size.width - videoSize.width) > 2
-            || abs(size.height - videoSize.height) > 2 {
+           videoSize.width > 8,
+           (abs(size.width - videoSize.width) > 2
+            || abs(size.height - videoSize.height) > 2) {
             lock.unlock()
             onVideoNeedsRestart?()
             return
@@ -131,34 +132,39 @@ final class PhoneSampleWriter: @unchecked Sendable {
                 return
             }
         }
-        guard let writer = videoWriter, let input = videoInput else {
+        guard let startedWriter = videoWriter, videoInput != nil else {
             lock.unlock()
             return
         }
-        if writer.status == .failed {
+        if startedWriter.status == .failed {
             lock.unlock()
             onVideoFailed?()
             return
         }
         if !videoStarted {
-            guard writer.status == .unknown || writer.status == .writing else {
+            guard startedWriter.status == .unknown || startedWriter.status == .writing else {
                 lock.unlock()
                 onVideoFailed?()
                 return
             }
-            if writer.status == .unknown, !writer.startWriting() {
+            if startedWriter.status == .unknown, !startedWriter.startWriting() {
                 lock.unlock()
                 onVideoFailed?()
                 return
             }
-            writer.startSession(atSourceTime: pts)
+            startedWriter.startSession(atSourceTime: pts)
             videoStarted = true
             let began = onVideoBegan
             lock.unlock()
             began?()
             lock.lock()
         }
-        guard writer.status == .writing, input.isReadyForMoreMediaData else {
+        // The callback may have reset, re-armed, or restarted the writer.
+        guard armed,
+              let writer = videoWriter,
+              let input = videoInput,
+              writer.status == .writing,
+              input.isReadyForMoreMediaData else {
             lock.unlock()
             return
         }

@@ -365,10 +365,10 @@ struct EditorView: View {
         GeometryReader { geo in
             let ratio = engine.canvas.size(phoneAspect: engine.phoneAspect).width
                 / engine.canvas.size(phoneAspect: engine.phoneAspect).height
-            let maxW = geo.size.width - 16
-            let maxH = geo.size.height - 8
+            let maxW = max(0, geo.size.width - 16)
+            let maxH = max(0, geo.size.height - 8)
             let fitW = min(maxW, maxH * ratio)
-            let fitH = fitW / ratio
+            let fitH = ratio > 0 ? max(0, fitW) / ratio : 0
             ZStack {
                 if editor.isReady {
                     DualReviewCanvas(
@@ -918,10 +918,10 @@ private struct PlayerContainerView: NSViewRepresentable {
 final class PlayerLayerNSView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
-        wantsLayer = true
         let playerLayer = AVPlayerLayer()
         playerLayer.videoGravity = .resizeAspectFill
         layer = playerLayer
+        wantsLayer = true
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }

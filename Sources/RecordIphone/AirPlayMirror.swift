@@ -61,6 +61,7 @@ final class AirPlayMirror: ObservableObject {
     private var stderrHandle: FileHandle?
     private var videoHandle: FileHandle?
     nonisolated(unsafe) private var videoSource: DispatchSourceRead?
+    nonisolated(unsafe) private var listenSource: DispatchSourceRead?
     nonisolated(unsafe) private var videoFD: Int32 = -1
     private var listenFD: Int32 = -1
     private var sockPath = ""
@@ -79,6 +80,7 @@ final class AirPlayMirror: ObservableObject {
     private var writerAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var writerStarted = false
     private var firstPTS: CMTime?
+    private var helperFirstPTSNanos: UInt64?
     private var pendingRecordURL: URL?
     private var lastFrameAt = Date.distantPast
     private var watchTimer: Timer?
@@ -147,6 +149,8 @@ final class AirPlayMirror: ObservableObject {
         videoHandle?.readabilityHandler = nil
         videoSource?.cancel()
         videoSource = nil
+        listenSource?.cancel()
+        listenSource = nil
         videoFD = -1
         stdoutHandle = nil
         stderrHandle = nil
@@ -164,7 +168,27 @@ final class AirPlayMirror: ObservableObject {
     }
 
     func beginRecording(to url: URL) throws {
-        Task { await finishWriter(cancel: true) }
+        let staleWriter = writer
+        let staleInput = writerInput
+        let staleURL = pendingRecordURL
+        writer = nil
+        writerInput = nil
+        writerAdaptor = nil
+        writerStarted = false
+        firstPTS = nil
+        helperFirstPTSNanos = nil
+        pendingRecordURL = nil
+        if staleWriter != nil || staleInput != nil {
+            Task.detached(priority: .utility) {
+                staleInput?.markAsFinished()
+                if let staleWriter, staleWriter.status == .writing {
+                    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                        staleWriter.finishWriting { cont.resume() }
+                    }
+                }
+                if let staleURL { try? FileManager.default.removeItem(at: staleURL) }
+            }
+        }
         let size = sourceSize.width > 8 && sourceSize.height > 8
             ? sourceSize : CGSize(width: 1170, height: 2532)
         let writer = try AVAssetWriter(url: url, fileType: .mov)
@@ -194,6 +218,7 @@ final class AirPlayMirror: ObservableObject {
         writerAdaptor = adaptor
         writerStarted = false
         firstPTS = nil
+        helperFirstPTSNanos = nil
         pendingRecordURL = url
     }
 
@@ -216,6 +241,7 @@ final class AirPlayMirror: ObservableObject {
         self.writer = nil
         writerStarted = false
         firstPTS = nil
+        helperFirstPTSNanos = nil
         pendingRecordURL = nil
         input?.markAsFinished()
         if writer.status == .writing {
@@ -310,17 +336,33 @@ final class AirPlayMirror: ObservableObject {
 
     private func appendRecord(pixel: CVPixelBuffer, ptsNanos: UInt64) {
         guard let writer, let input = writerInput, let adaptor = writerAdaptor else { return }
-        let now = CMClockGetTime(CMClockGetHostTimeClock())
-        let packetTime = CMTime(value: Int64(ptsNanos), timescale: 1_000_000_000)
-        let stamp = ptsNanos > 0 ? packetTime : now
+        guard writer.status != .failed else { return }
+        let stamp: CMTime
+        if ptsNanos > 0 {
+            let origin = helperFirstPTSNanos ?? ptsNanos
+            if helperFirstPTSNanos == nil { helperFirstPTSNanos = ptsNanos }
+            let delta = ptsNanos >= origin ? ptsNanos - origin : 0
+            stamp = CMTime(value: Int64(delta), timescale: 1_000_000_000)
+        } else if helperFirstPTSNanos != nil {
+            // Already committed to helper timestamps; drop a packet with none.
+            return
+        } else if let firstPTS {
+            stamp = CMTimeMaximum(firstPTS, CMClockGetTime(CMClockGetHostTimeClock()))
+        } else {
+            stamp = CMClockGetTime(CMClockGetHostTimeClock())
+        }
         if !writerStarted {
             guard writer.startWriting() else { return }
             writer.startSession(atSourceTime: stamp)
             writerStarted = true
             firstPTS = stamp
         }
+        guard let firstPTS, stamp >= firstPTS else { return }
         if input.isReadyForMoreMediaData {
-            adaptor.append(pixel, withPresentationTime: stamp)
+            if !adaptor.append(pixel, withPresentationTime: stamp) {
+                NSLog("[airplay] record append failed: %@",
+                      writer.error?.localizedDescription ?? "unknown")
+            }
         }
     }
 
@@ -362,10 +404,9 @@ final class AirPlayMirror: ObservableObject {
         unlink(path)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let _ = withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
-            path.withCString { strcpy(ptr, $0) }
+        guard var addr = Self.unixSockaddr(path: path) else {
+            close(fd)
+            return nil
         }
         let len = socklen_t(MemoryLayout<sockaddr_un>.size)
         let bound = withUnsafePointer(to: &addr) {
@@ -375,40 +416,68 @@ final class AirPlayMirror: ObservableObject {
             close(fd)
             return nil
         }
+        let flags = fcntl(fd, F_GETFL, 0)
+        if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
         listenFD = fd
         sockPath = path
-        ioQueue.async { [weak self] in
+        let queue = ioQueue
+        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        src.setEventHandler { [weak self] in
             guard let self else { return }
-            let client = accept(fd, nil, nil)
-            guard client >= 0 else { return }
-            let flags = fcntl(client, F_GETFL, 0)
-            if flags >= 0 { _ = fcntl(client, F_SETFL, flags | O_NONBLOCK) }
-            let src = DispatchSource.makeReadSource(fileDescriptor: client, queue: self.ioQueue)
-            src.setEventHandler { [weak self] in
-                var buf = [UInt8](repeating: 0, count: 256 * 1024)
-                while true {
-                    let n = buf.withUnsafeMutableBytes { raw in
-                        read(client, raw.baseAddress, raw.count)
-                    }
-                    if n > 0 {
-                        self?.consumeVideo(Data(buf.prefix(n)))
-                    } else if n == 0 {
-                        src.cancel()
-                        break
-                    } else if errno == EAGAIN || errno == EWOULDBLOCK {
-                        break
-                    } else {
-                        src.cancel()
-                        break
-                    }
+            while true {
+                let client = accept(fd, nil, nil)
+                if client < 0 {
+                    if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { break }
+                    break
+                }
+                self.attachVideoClient(client, queue: queue)
+            }
+        }
+        listenSource = src
+        src.resume()
+        return path
+    }
+
+    nonisolated private func attachVideoClient(_ client: Int32, queue: DispatchQueue) {
+        videoSource?.cancel()
+        videoSource = nil
+        let flags = fcntl(client, F_GETFL, 0)
+        if flags >= 0 { _ = fcntl(client, F_SETFL, flags | O_NONBLOCK) }
+        let src = DispatchSource.makeReadSource(fileDescriptor: client, queue: queue)
+        src.setEventHandler { [weak self] in
+            var buf = [UInt8](repeating: 0, count: 256 * 1024)
+            while true {
+                let n = buf.withUnsafeMutableBytes { raw in
+                    read(client, raw.baseAddress, raw.count)
+                }
+                if n > 0 {
+                    self?.consumeVideo(Data(buf.prefix(n)))
+                } else if n == 0 {
+                    src.cancel()
+                    break
+                } else if errno == EAGAIN || errno == EWOULDBLOCK {
+                    break
+                } else {
+                    src.cancel()
+                    break
                 }
             }
-            src.setCancelHandler { close(client) }
-            self.videoFD = client
-            self.videoSource = src
-            src.resume()
         }
-        return path
+        src.setCancelHandler { close(client) }
+        videoFD = client
+        videoSource = src
+        src.resume()
+    }
+
+    private static func unixSockaddr(path: String) -> sockaddr_un? {
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
+        guard path.utf8.count < capacity else { return nil }
+        _ = withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
+            path.withCString { strlcpy(ptr, $0, capacity) }
+        }
+        return addr
     }
 
     private func readEvents(_ handle: FileHandle) {
@@ -479,10 +548,8 @@ final class AirPlayMirror: ObservableObject {
         print("selftest listen \(path)")
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { print("selftest socket fail"); return false }
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        _ = withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
-            path.withCString { strcpy(ptr, $0) }
+        guard var addr = Self.unixSockaddr(path: path) else {
+            print("selftest path too long"); close(fd); return false
         }
         let ok = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -521,21 +588,17 @@ struct AirPlayPreviewView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> AirPlayPreviewNSView {
         let view = AirPlayPreviewNSView()
-        view.store = mirror.latestFrame
         view.attach(mirror.displayLayer)
         return view
     }
 
     func updateNSView(_ nsView: AirPlayPreviewNSView, context: Context) {
-        nsView.store = mirror.latestFrame
         nsView.attach(mirror.displayLayer)
     }
 }
 
 final class AirPlayPreviewNSView: NSView {
-    var store: FrameStore?
     private weak var hosted: AVSampleBufferDisplayLayer?
-    private var timer: Timer?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -548,8 +611,6 @@ final class AirPlayPreviewNSView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    deinit { timer?.invalidate() }
-
     func attach(_ display: AVSampleBufferDisplayLayer) {
         if hosted === display { return }
         hosted?.removeFromSuperlayer()
@@ -558,14 +619,6 @@ final class AirPlayPreviewNSView: NSView {
         layer?.addSublayer(display)
         hosted = display
         needsLayout = true
-    }
-
-    private func pullFrame() {
-        guard let image = store?.getImage() else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer?.contents = image
-        CATransaction.commit()
     }
 
     override func layout() {

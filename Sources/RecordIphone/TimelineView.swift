@@ -155,7 +155,7 @@ struct TimelineStrip: View {
 
     private func audioTrack<V: View>(label: String, muted: Bool, onMute: @escaping () -> Void,
                                      @ViewBuilder content: () -> V) -> some View {
-        HStack(alignment: .center, spacing: 4) {
+        HStack(alignment: .center, spacing: 6) {
             Button(action: onMute) {
                 HStack(spacing: 3) {
                     Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")

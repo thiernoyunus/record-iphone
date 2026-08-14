@@ -222,11 +222,14 @@ struct SolidSwatch: Identifiable {
     ]
 
     /// Colors shown in the editor Style menu. Named, not “Pastel / Pastel”.
-    static let styleMenu: [SolidSwatch] = [
-        solids[0], solids[1], solids[2], solids[3],
-        solids[6], solids[7], solids[9], solids[11],
-        solids[12], solids[13], solids[15], solids[17],
+    private static let styleMenuIDs = [
+        "white", "cream", "black", "charcoal",
+        "navy", "blue", "teal", "green",
+        "gold", "orange", "red", "purple",
     ]
+    static let styleMenu: [SolidSwatch] = styleMenuIDs.compactMap { id in
+        solids.first { $0.id == id }
+    }
 }
 
 struct CapturePreset: Codable, Identifiable, Equatable {

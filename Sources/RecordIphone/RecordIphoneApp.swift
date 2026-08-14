@@ -103,7 +103,8 @@ struct RecordIphoneApp: App {
 ///   --editor-open-check <phone> <camera>
 ///                                   times the exact work the review screen
 ///                                   does after Stop (compose + player item).
-///                                   Fails if any step exceeds 15 seconds.
+///                                   Fails if that work takes more than 8 seconds.
+///                                   A 20-second outer timeout covers a hang.
 ///   --connect-safety-check          USB connect policy + preview detach order.
 ///                                   Fails (exit 3) if the main thread hangs.
 private func runHeadlessModeIfRequested() {
@@ -333,9 +334,12 @@ private func runReproStopOpen() {
     }
 
     // Watchdog: if main is stuck opening the fresh file, die with a clear code.
-    DispatchQueue.global().asyncAfter(deadline: .now() + 8) {
-        print("FAIL HANG opening just-finished recording on the main thread")
-        exit(3)
+    let openedOK = OnceFlag()
+    DispatchQueue.global().asyncAfter(deadline: .now() + 15) {
+        if !openedOK.isSet {
+            print("FAIL HANG opening just-finished recording on the main thread")
+            exit(3)
+        }
     }
 
     let opened = DispatchSemaphore(value: 0)
@@ -366,6 +370,7 @@ private func runReproStopOpen() {
         } catch {
             print("FAIL remux/open: \(error)")
         }
+        openedOK.mark()
         opened.signal()
     }
     let deadline = Date().addingTimeInterval(15)
@@ -401,6 +406,22 @@ private func awaitBlocking<T>(_ work: @escaping @Sendable () async throws -> T) 
 
 private final class BlockingBox<T>: @unchecked Sendable {
     var value: Result<T, Error>?
+}
+
+private final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    func mark() {
+        lock.lock()
+        done = true
+        lock.unlock()
+    }
+
+    var isSet: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return done
+    }
 }
 
 func writeFreshRecording(to url: URL, seconds: Double) async throws {

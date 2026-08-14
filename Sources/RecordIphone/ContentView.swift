@@ -315,7 +315,10 @@ struct ContentView: View {
                 x: min(max(value.location.x / size.width, 0.08), 0.92),
                 y: min(max(value.location.y / size.height, 0.08), 0.92))
         }.onEnded { value in
-            guard engine.presenterLayout == .floating else { return }
+            guard !busy, engine.presenterLayout == .floating else {
+                dragBubble = nil
+                return
+            }
             engine.bubbleCenter = CGPoint(
                 x: min(max(value.location.x / size.width, 0.08), 0.92),
                 y: min(max(value.location.y / size.height, 0.08), 0.92))
@@ -1218,8 +1221,7 @@ struct HomeLandingView: View {
                         ForEach(engine.recentProjects) { project in
                             Button { engine.openProject(project) } label: {
                                 HStack(spacing: 12) {
-                                    ProjectThumb(dir: project.dir)
-                                        .frame(width: 72, height: 48)
+                                    ProjectThumb(dir: project.dir, width: 72, height: 48)
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(project.displayName)
                                             .font(.system(size: 14, weight: .semibold))
@@ -1290,6 +1292,8 @@ struct ElapsedTimeText: View {
 
 struct ProjectThumb: View {
     let dir: URL
+    var width: CGFloat = 42
+    var height: CGFloat = 30
     @State private var image: CGImage?
     private static let cache = NSCache<NSURL, CGImage>()
 
@@ -1301,7 +1305,7 @@ struct ProjectThumb: View {
                 Color.black.opacity(0.06)
             }
         }
-        .frame(width: 42, height: 30)
+        .frame(width: width, height: height)
         .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
         .task {
             let url = dir.appendingPathComponent("phone.mov")
@@ -1470,7 +1474,7 @@ struct CaptureLayerView: NSViewRepresentable {
 
     func updateNSView(_ nsView: CapturePreviewNSView, context: Context) {
         nsView.sessionQueue = sessionQueue
-        if nsView.previewLayer.session !== session {
+        if nsView.requestedSession !== session {
             nsView.bind(session: session, then: onAttached)
         }
         if nsView.previewLayer.videoGravity != gravity {
@@ -1486,6 +1490,8 @@ struct CaptureLayerView: NSViewRepresentable {
 final class CapturePreviewNSView: NSView {
     let previewLayer = AVCaptureVideoPreviewLayer()
     var sessionQueue: DispatchQueue?
+    /// Main-thread copy of the session requested for `previewLayer`.
+    private(set) var requestedSession: AVCaptureSession?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1502,6 +1508,7 @@ final class CapturePreviewNSView: NSView {
     /// Must run on `sessionQueue`. Setting the session on the main thread
     /// while startRunning is in flight aborts in `_setRunning`.
     func bind(session: AVCaptureSession, then onAttached: @escaping () -> Void) {
+        requestedSession = session
         let layer = previewLayer
         let queue = sessionQueue ?? DispatchQueue.global(qos: .userInitiated)
         queue.async {
@@ -1515,6 +1522,7 @@ final class CapturePreviewNSView: NSView {
     /// Clear the session on the capture queue. Doing `setSession:` from
     /// dealloc during a Core Animation commit deadlocks with stopRunning.
     func detachSessionOffMain() {
+        requestedSession = nil
         previewLayer.removeFromSuperlayer()
         let layer = previewLayer
         let queue = sessionQueue ?? DispatchQueue.global(qos: .utility)
