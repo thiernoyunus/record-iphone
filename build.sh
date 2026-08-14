@@ -25,6 +25,15 @@ fi
 if [ -f Sources/AirPlayHelper/raop_rtp_mirror.c ]; then
   cp Sources/AirPlayHelper/raop_rtp_mirror.c Vendor/UxPlay/lib/raop_rtp_mirror.c
 fi
+# Snapshot/restore so a rejected type-0x05 trailer cannot scramble later frames.
+if [ -f Sources/AirPlayHelper/mirror_buffer.c ]; then
+  cp Sources/AirPlayHelper/mirror_buffer.c Vendor/UxPlay/lib/mirror_buffer.c
+  cp Sources/AirPlayHelper/mirror_buffer.h Vendor/UxPlay/lib/mirror_buffer.h
+fi
+if [ -f Sources/AirPlayHelper/crypto.c ]; then
+  cp Sources/AirPlayHelper/crypto.c Vendor/UxPlay/lib/crypto.c
+  cp Sources/AirPlayHelper/crypto.h Vendor/UxPlay/lib/crypto.h
+fi
 
 echo "Building airplay-helper…"
 cmake -S Sources/AirPlayHelper -B .build-airplay -DCMAKE_BUILD_TYPE=Release
