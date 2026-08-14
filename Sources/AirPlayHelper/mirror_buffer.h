@@ -30,7 +30,10 @@ void mirror_buffer_decrypt(mirror_buffer_t *raop_mirror, unsigned char* input, u
 void mirror_buffer_destroy(mirror_buffer_t *mirror_buffer);
 
 /* Snapshot/restore so a rejected type-0x05 trailer cannot advance the
-   shared AES-CTR stream and scramble later video packets. */
+   shared AES-CTR stream and scramble later video packets.
+   snapshot() returns an owned snapshot, or NULL.
+   restore() moves the saved cipher back into the buffer but does not
+   free the snapshot. Always call snap_destroy() after restore or discard. */
 typedef struct mirror_buffer_snap_s mirror_buffer_snap_t;
 mirror_buffer_snap_t *mirror_buffer_snapshot(mirror_buffer_t *mirror_buffer);
 void mirror_buffer_restore(mirror_buffer_t *mirror_buffer, mirror_buffer_snap_t *snap);
