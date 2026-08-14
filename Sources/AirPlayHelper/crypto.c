@@ -49,11 +49,11 @@ struct aes_ctx_s {
     uint8_t block_offset;
 };
 
-uint8_t waste[AES_128_BLOCK_SIZE];
+static uint8_t waste[AES_128_BLOCK_SIZE];
 
 // Common AES utilities
 
-void handle_error(const char* location) {
+static void handle_error(const char* location) {
     long error = ERR_get_error();
     const char* error_str = ERR_error_string(error, NULL);
     fprintf(stderr, "Crypto error at %s: %s\n", location, error_str);
@@ -629,23 +629,25 @@ int get_random_bytes(unsigned char *buf, int num) {
 void pk_to_base64(const unsigned char *pk, int pk_len, char *pk_base64, int len) {
     memset(pk_base64, 0, len);
     int len64 = (4 * (pk_len /3)) + (pk_len % 3 ? 4 : 0);
-    
-    assert (len > len64);
-    
+    if (len <= len64 || pk_len < 0) return;
+
     BIO *b64 = BIO_new(BIO_f_base64());
-    BIO *bio = BIO_new(BIO_s_mem());
-    BUF_MEM *bufferPtr = NULL;
-
-
-    bio = BIO_push(b64, bio);
-  
+    BIO *mem = BIO_new(BIO_s_mem());
+    if (!b64 || !mem) {
+        BIO_free(b64);
+        BIO_free(mem);
+        return;
+    }
+    BIO *bio = BIO_push(b64, mem);
     BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
     BIO_write(bio, pk, pk_len);
     BIO_flush(bio);
 
+    BUF_MEM *bufferPtr = NULL;
     BIO_get_mem_ptr(bio, &bufferPtr);
-    BIO_set_close(bio, BIO_NOCLOSE);
+    if (bufferPtr && bufferPtr->data && (size_t)bufferPtr->length >= (size_t)len64) {
+        memcpy(pk_base64, bufferPtr->data, (size_t)len64);
+    }
     BIO_free_all(bio);
-    memcpy(pk_base64,(*bufferPtr).data, len64);
 }
   

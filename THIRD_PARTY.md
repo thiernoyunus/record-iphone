@@ -41,9 +41,16 @@ repository **is** the corresponding source for every build we ship:
 - UxPlay at the pinned commit above
 
 Anyone who receives a copy of the app may obtain that complete source from
-the public git repository that built it, or by asking the distributor for
-the same tree. Include this file and the pinned SHA with any binary you
-give someone else.
+this public repository, which is the corresponding-source location for
+every binary we ship:
+
+    https://github.com/thiernoyunus/record-iphone
+
+Use the git revision that built the app (or a later commit on the same
+branch that still contains these overlays). A GitHub “Source code” archive
+of that revision is an immutable copy of this tree. If you redistribute a
+binary, include this notice and the pinned UxPlay SHA, and keep that
+repository (or an archive of the same revision) available to recipients.
 
 To fetch the pinned UxPlay tree:
 
