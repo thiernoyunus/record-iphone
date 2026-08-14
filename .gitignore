@@ -1,3 +1,5 @@
 .build/
+.build-airplay/
 dist/
+Vendor/UxPlay/
 .DS_Store
