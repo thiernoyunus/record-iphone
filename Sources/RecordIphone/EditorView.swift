@@ -1,346 +1,966 @@
 import SwiftUI
 import AVKit
-
-private let accent = Color(red: 0.47, green: 0.40, blue: 0.95)
-private let chrome = Color(red: 0.075, green: 0.075, blue: 0.09)
-private let panel = Color(red: 0.125, green: 0.125, blue: 0.15)
+import AppKit
 
 struct EditorView: View {
     @ObservedObject var editor: EditorState
     @EnvironmentObject var engine: CaptureEngine
+    @State private var confirmTrash = false
+    @State private var addingScene = false
+    @State private var hexDraft = "#FFFFFF"
+    @State private var sceneDragBase: [UUID: Double] = [:]
+    @State private var sceneDurationBase: [UUID: Double] = [:]
+    @State private var lookOpen = false
+    @State private var cameraSelected = false
+    @State private var timelineHeightBase: CGFloat?
+    @State private var timelineScrollMonitor: Any?
 
     var body: some View {
-        VStack(spacing: 0) {
-            topBar
-            preview
-                .padding(.horizontal, 24)
-                .padding(.vertical, 12)
-            transport
-                .padding(.horizontal, 24)
-            TimelineStrip(editor: editor)
-                .frame(height: 96)
-                .padding(.horizontal, 24)
-                .padding(.top, 8)
-                .padding(.bottom, 18)
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                stage
+                    .padding(.horizontal, 28)
+                    .padding(.top, 12)
+                switch editor.mode {
+                case .edit:
+                    editorToolbar
+                    ZoomInspector(editor: editor)
+                    timelineDeck
+                case .scenes:
+                    sceneHeader
+                    sceneTimeline
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 14)
+                }
+            }
+            if lookOpen {
+                Color.clear.frame(width: Frame.panelWidth)
+            }
         }
-        .background(chrome)
+        .background(Frame.bg)
+        .preferredColorScheme(.light)
+        .overlay(alignment: .trailing) {
+            if lookOpen {
+                LookPanel(
+                    engine: engine,
+                    showsCamera: editor.hasCamera,
+                    showsMic: editor.hasMic,
+                    cameraStatus: editor.cameraClipStatus,
+                    phoneMix: $editor.phoneMix,
+                    micMix: $editor.micMix,
+                    onChange: {
+                        editor.applyPlaybackVolumes()
+                        editor.refreshPreview(immediate: true)
+                    },
+                    onClose: { lookOpen = false }
+                )
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.18), value: lookOpen)
         .overlay { if let p = editor.exportProgress { exportOverlay(p) } }
-        .frame(minWidth: 860, minHeight: 620)
+        .frame(minWidth: 1060, minHeight: 700)
+        .onAppear {
+            hexDraft = hexString(from: (
+                engine.customBackgroundRGB?[safe: 0] ?? 1,
+                engine.customBackgroundRGB?[safe: 1] ?? 1,
+                engine.customBackgroundRGB?[safe: 2] ?? 1
+            ))
+            timelineScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+                guard event.modifierFlags.contains(.command) else { return event }
+                editor.bumpTimelineZoom(event.scrollingDeltaY > 0 ? 1.12 : 1 / 1.12)
+                return nil
+            }
+        }
+        .onDisappear {
+            if let timelineScrollMonitor {
+                NSEvent.removeMonitor(timelineScrollMonitor)
+            }
+            timelineScrollMonitor = nil
+        }
+        .confirmationDialog("Move this recording to the Trash?", isPresented: $confirmTrash) {
+            Button("Move to Trash", role: .destructive) {
+                let dir = editor.dir
+                editor.close()
+                engine.trashProject(at: dir)
+            }
+        } message: {
+            Text("The raw recordings, edits, and any exports in this project folder go to the Trash.")
+        }
     }
 
-    // MARK: - Top bar
+    // MARK: - Editor
 
-    private var topBar: some View {
-        HStack(spacing: 14) {
-            Button {
-                editor.close()
-            } label: {
-                Label("Done", systemImage: "chevron.left")
+    private var editorToolbar: some View {
+        HStack(spacing: 10) {
+            Button { editor.close() } label: {
+                Label("Home", systemImage: "house")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Frame.label)
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .background(Frame.surface, in: Capsule())
+                    .overlay(Capsule().strokeBorder(Frame.pillStroke, lineWidth: 1))
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-
-            Text(editor.dir.lastPathComponent)
-                .font(.callout.weight(.medium))
-                .foregroundStyle(.secondary)
+            .help("Back to your clips")
 
             Spacer()
 
-            Picker("", selection: $engine.background) {
-                ForEach(BackgroundPreset.allCases) { Text($0.rawValue).tag($0) }
+            if editor.cameraClipStatus == .wantedButMissing {
+                Text("Camera was on — clip didn’t save")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Frame.secondary)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.12), in: Capsule())
             }
-            .labelsHidden()
-            .frame(width: 105)
-
-            Toggle(isOn: $engine.showBezel) { Image(systemName: "iphone") }
-                .toggleStyle(.button)
-                .help("Device frame")
-
-            Picker("", selection: $engine.bubbleFraction) {
-                Text("S").tag(CGFloat(0.22)); Text("M").tag(CGFloat(0.30)); Text("L").tag(CGFloat(0.40))
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 96)
-            .help("Camera bubble size")
 
             Button {
-                editor.export()
+                lookOpen.toggle()
+                if lookOpen, editor.hasCamera { cameraSelected = true }
             } label: {
-                Label("Export", systemImage: "square.and.arrow.up")
-                    .font(.body.weight(.semibold))
-                    .padding(.horizontal, 6)
+                Text("Look")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(lookOpen ? .white : Frame.label)
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .background(lookOpen ? Frame.accent : Frame.surface, in: Capsule())
+                    .overlay(Capsule().strokeBorder(lookOpen ? Color.clear : Frame.pillStroke, lineWidth: 1))
             }
-            .buttonStyle(.borderedProminent)
-            .tint(accent)
-            .keyboardShortcut("e")
+            .buttonStyle(.plain)
+            .help("Same look controls as before you recorded")
+
+            Button { confirmTrash = true } label: {
+                Label("Delete", systemImage: "trash")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Frame.delete)
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .background(Frame.delete.opacity(0.08), in: Capsule())
+            }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .background(panel)
-        .onChange(of: engine.background) { editor.refreshPreview() }
-        .onChange(of: engine.showBezel) { editor.refreshPreview() }
-        .onChange(of: engine.bubbleFraction) { editor.refreshPreview() }
+        .padding(.vertical, 8)
     }
 
-    // MARK: - Preview + zoom reticle
+    private func pickAndExport() {
+        let settings = AppSettings.shared
+        switch settings.exportPlace {
+        case .ask:
+            if let url = EditorState.askWhereToSave(suggestedName: "Recording.mp4",
+                                                    startingIn: settings.lastExportDirectory) {
+                settings.rememberExportDirectory(url)
+                editor.export(to: url)
+            }
+        case .recordingFolder:
+            editor.export(to: editor.nextExportURL(in: editor.dir))
+        case .customFolder:
+            let folder = settings.customFolderURL ?? editor.dir
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            editor.export(to: editor.nextExportURL(in: folder))
+        }
+    }
 
-    private var preview: some View {
+    // MARK: - Scene editor
+
+    private var sceneHeader: some View {
+        HStack {
+                Button { editor.mode = .edit } label: {
+                    Label("Back", systemImage: "chevron.left")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Frame.label)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(Frame.surface, in: Capsule())
+                        .overlay(Capsule().strokeBorder(Frame.pillStroke, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                VStack(spacing: 2) {
+                    Text("Scene Editor").font(.system(size: 13, weight: .semibold)).foregroundStyle(Frame.label)
+                    Text("Arrange what viewers see. Trim and playback settings are unchanged.")
+                        .font(.system(size: 11)).foregroundStyle(Frame.tertiary)
+                }
+                Spacer()
+                Button { editor.mode = .edit } label: {
+                    Label("Done", systemImage: "checkmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14).padding(.vertical, 7)
+                        .background(Frame.save, in: Capsule())
+                }
+                .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 18).padding(.vertical, 10)
+    }
+
+    private var sceneTimeline: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                jumpToStartButton
+                playButton
+                transportClock
+                Spacer()
+            }
+            GeometryReader { geo in
+                let pps = geo.size.width / max(editor.duration, 0.1)
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.white)
+                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Frame.hairline))
+                    if editor.scenes.isEmpty {
+                        Text("Drag to add a scene")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Frame.tertiary)
+                            .frame(maxWidth: .infinity)
+                    }
+                    ForEach(editor.scenes) { clip in
+                        sceneChip(clip, pps: pps)
+                    }
+                    Rectangle().fill(Frame.accent).frame(width: 2)
+                        .offset(x: editor.currentTime * pps)
+                }
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 6).onChanged { value in
+                    editor.seekRaw(to: value.location.x / pps)
+                })
+                .contextMenu {
+                    Button("Camera") { addScene(.camera) }
+                    Button("Camera + Device") { addScene(.both) }
+                    Button("Device") { addScene(.device) }
+                }
+                .onTapGesture { } // keep context menu
+            }
+            .frame(height: 64)
+            HStack {
+                ForEach(SceneKind.allCases) { kind in
+                    Button { addScene(kind) } label: {
+                        Text(kind.rawValue)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Frame.label)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Color.black.opacity(0.05),
+                                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer()
+                if let scene = editor.scenes.first(where: { $0.id == editor.selectedSceneID }) {
+                    Text("Drag the ends to make it longer")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Frame.tertiary)
+                    Slider(value: Binding(
+                        get: { scene.duration },
+                        set: { v in
+                            var next = scene
+                            let sized = SceneTiming.resize(start: scene.start, duration: scene.duration,
+                                                           delta: v - scene.duration, leading: false,
+                                                           timeline: editor.duration)
+                            next.start = sized.start
+                            next.duration = sized.duration
+                            editor.updateScene(next, rebuild: false)
+                        }
+                    ), in: SceneTiming.minDuration...max(SceneTiming.minDuration, editor.duration - scene.start)) { editing in
+                        if !editing, let current = editor.scenes.first(where: { $0.id == scene.id }) {
+                            editor.updateScene(current, rebuild: true)
+                        }
+                    }
+                    .frame(maxWidth: 180)
+                    Button("Remove scene") { editor.deleteSelectedScene() }
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Frame.delete)
+                        .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color.white, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Frame.hairline))
+    }
+
+    private func addScene(_ kind: SceneKind) {
+        let start = editor.currentTime
+        let remaining = max(1, editor.duration - start)
+        editor.addScene(kind: kind, start: start, duration: min(4, remaining))
+    }
+
+    private func sceneChip(_ clip: SceneClip, pps: CGFloat) -> some View {
+        let on = editor.selectedSceneID == clip.id
+        let width = max(56, clip.duration * pps)
+        return ZStack {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(on ? Frame.accent.opacity(0.18) : Color.black.opacity(0.06))
+            Text("\(clip.kind.rawValue)  \(String(format: "%.1fs", clip.duration))")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Frame.label)
+                .lineLimit(1)
+            HStack {
+                Capsule().fill(Color.black.opacity(0.35)).frame(width: 3, height: 16)
+                Spacer()
+                Capsule().fill(Color.black.opacity(0.35)).frame(width: 3, height: 16)
+            }
+            .padding(.horizontal, 5)
+        }
+        .frame(width: width, height: 36)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(on ? Frame.accent : Color.clear, lineWidth: 1)
+        )
+        .offset(x: clip.start * pps)
+        .onTapGesture {
+            editor.selectedSceneID = clip.id
+            editor.seek(to: clip.start + 0.1)
+        }
+        .gesture(DragGesture(minimumDistance: 3).onChanged { value in
+            if sceneDragBase[clip.id] == nil { sceneDragBase[clip.id] = clip.start }
+            let moved = SceneTiming.move(start: sceneDragBase[clip.id] ?? clip.start,
+                                         duration: clip.duration,
+                                         delta: value.translation.width / pps,
+                                         timeline: editor.duration)
+            var c = clip
+            c.start = moved.start
+            c.duration = moved.duration
+            editor.updateScene(c, rebuild: false)
+        }.onEnded { _ in
+            if let current = editor.scenes.first(where: { $0.id == clip.id }) {
+                editor.updateScene(current, rebuild: true)
+            }
+            sceneDragBase[clip.id] = nil
+        })
+        .overlay(alignment: .leading) {
+            Color.clear.frame(width: 12, height: 36).contentShape(Rectangle())
+                .highPriorityGesture(sceneResize(clip, pps: pps, leading: true))
+        }
+        .overlay(alignment: .trailing) {
+            Color.clear.frame(width: 12, height: 36).contentShape(Rectangle())
+                .highPriorityGesture(sceneResize(clip, pps: pps, leading: false))
+        }
+        .help("Drag the middle to move. Drag either end to make this scene longer or shorter.")
+    }
+
+    private func sceneResize(_ clip: SceneClip, pps: CGFloat, leading: Bool) -> some Gesture {
+        DragGesture(minimumDistance: 1).onChanged { value in
+            if sceneDragBase[clip.id] == nil {
+                sceneDragBase[clip.id] = clip.start
+                sceneDurationBase[clip.id] = clip.duration
+            }
+            let sized = SceneTiming.resize(start: sceneDragBase[clip.id] ?? clip.start,
+                                           duration: sceneDurationBase[clip.id] ?? clip.duration,
+                                           delta: value.translation.width / pps,
+                                           leading: leading,
+                                           timeline: editor.duration)
+            var c = clip
+            c.start = sized.start
+            c.duration = sized.duration
+            editor.updateScene(c, rebuild: false)
+        }.onEnded { _ in
+            if let current = editor.scenes.first(where: { $0.id == clip.id }) {
+                editor.updateScene(current, rebuild: true)
+            }
+            sceneDragBase[clip.id] = nil
+            sceneDurationBase[clip.id] = nil
+        }
+    }
+
+    // MARK: - Stage
+
+    private var stage: some View {
         GeometryReader { geo in
+            let ratio = engine.canvas.size(phoneAspect: engine.phoneAspect).width
+                / engine.canvas.size(phoneAspect: engine.phoneAspect).height
+            let maxW = geo.size.width - 16
+            let maxH = geo.size.height - 8
+            let fitW = min(maxW, maxH * ratio)
+            let fitH = fitW / ratio
             ZStack {
-                PlayerContainerView(player: editor.player)
-                if let zoom = editor.selectedZoom,
-                   editor.currentTime >= zoom.start - 0.2, editor.currentTime <= zoom.end + 0.2 {
-                    reticle(for: zoom, in: geo.size)
+                if editor.isReady {
+                    DualReviewCanvas(
+                        editor: editor,
+                        engine: engine,
+                        cameraSelected: $cameraSelected
+                    )
+                } else if editor.loadFailed == nil {
+                    VStack(spacing: 10) {
+                        ProgressView().controlSize(.large)
+                        Text("Opening recording…")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Frame.secondary)
+                    }
                 }
                 if let failure = editor.loadFailed {
-                    Text(failure).foregroundStyle(.white).padding()
+                    VStack(spacing: 10) {
+                        Text("Couldn’t open this take")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Frame.label)
+                        Text(failure)
+                            .font(.system(size: 13))
+                            .foregroundStyle(Frame.secondary)
+                            .multilineTextAlignment(.center)
+                        Button("Back to Home") { editor.close() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(Frame.accent)
+                    }
+                    .padding(24)
                 }
             }
+            .frame(width: fitW, height: fitH)
+            .background(stageFill)
+            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .shadow(color: .black.opacity(0.18), radius: 28, y: 12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .aspectRatio(engine.canvas.size.width / engine.canvas.size.height, contentMode: .fit)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.45), radius: 18, y: 6)
     }
 
-    private func reticle(for zoom: ZoomSegment, in size: CGSize) -> some View {
-        ZStack {
-            Circle().stroke(accent, lineWidth: 2).frame(width: 56, height: 56)
-            Circle().fill(accent.opacity(0.25)).frame(width: 56, height: 56)
-            Image(systemName: "plus").font(.system(size: 13, weight: .bold)).foregroundStyle(accent)
-        }
-        .position(x: zoom.center.x * size.width, y: zoom.center.y * size.height)
-        .gesture(DragGesture(minimumDistance: 1).onChanged { value in
-            var z = zoom
-            z.center = CGPoint(x: min(max(value.location.x / size.width, 0.05), 0.95),
-                               y: min(max(value.location.y / size.height, 0.05), 0.95))
-            editor.update(z)
-        })
-        .help("Drag to aim the zoom")
+    private var stageFill: some View {
+        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background)
     }
 
-    // MARK: - Transport row
+    // MARK: - Transport + timeline
 
-    private var transport: some View {
-        HStack(spacing: 14) {
-            Button {
-                editor.togglePlay()
-            } label: {
-                Image(systemName: editor.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 16, weight: .semibold))
-                    .frame(width: 34, height: 30)
+    private var playButton: some View {
+        Button { editor.togglePlay() } label: {
+            Image(systemName: editor.isPlaying ? "pause.fill" : "play.fill")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(Frame.accent, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .help(editor.isPlaying ? "Pause" : "Play")
+        .keyboardShortcut(.space, modifiers: [])
+    }
+
+    private var jumpToStartButton: some View {
+        Button { editor.seek(to: editor.trimStart) } label: {
+            Image(systemName: "backward.end.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Frame.label)
+                .frame(width: 36, height: 36)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Jump to start")
+    }
+
+    private var transportClock: some View {
+        Text(String(format: "%@ / %@",
+                    clock(max(0, editor.currentTime - editor.trimStart)),
+                    clock(max(0, editor.trimEnd - editor.trimStart))))
+            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+            .foregroundStyle(Frame.label)
+            .frame(minWidth: 96, alignment: .leading)
+    }
+
+    private func deckIcon(_ system: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: system)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Frame.label)
+                .frame(width: 32, height: 32)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private var timelineTools: some View {
+        HStack(spacing: 6) {
+            deckIcon(editor.timelineHidden
+                     ? "rectangle.bottomhalf.inset.filled"
+                     : "rectangle.bottomhalf.filled",
+                     help: editor.timelineHidden ? "Show timeline" : "Hide timeline") {
+                editor.timelineHidden.toggle()
             }
-            .keyboardShortcut(.space, modifiers: [])
-
-            Text("\(timeString(editor.currentTime)) / \(timeString(editor.duration))")
-                .font(.callout.monospacedDigit())
-                .foregroundStyle(.secondary)
-
-            Button {
-                editor.reloadPreview()
-            } label: {
-                Image(systemName: "arrow.clockwise")
+            deckIcon("minus.magnifyingglass", help: "Zoom out") {
+                editor.bumpTimelineZoom(1 / 1.15)
+            }
+            deckIcon("plus.magnifyingglass", help: "Zoom in — or hold ⌘ and scroll") {
+                editor.bumpTimelineZoom(1.15)
+            }
+            Button { editor.addZoom() } label: {
+                Label("Add Zoom", systemImage: "plus.magnifyingglass")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(Frame.accent, in: Capsule())
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .keyboardShortcut("r")
-            .help("Reload the preview (⌘R) — fixes playback if the sound drops out")
+            .disabled(!editor.isReady)
+            Button { editor.mode = .scenes } label: {
+                Text("Scenes")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Frame.label)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(Color.black.opacity(0.05), in: Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+    }
 
-            Spacer()
-
-            if let zoom = editor.selectedZoom {
-                HStack(spacing: 10) {
-                    Text("Zoom \(String(format: "%.1f×", zoom.level))")
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(accent)
-                    Slider(value: Binding(
-                        get: { zoom.level },
-                        set: { var z = zoom; z.level = $0; editor.update(z) }
-                    ), in: 1.2...3.5)
-                    .frame(width: 140)
-                    Button(role: .destructive) {
-                        editor.deleteSelectedZoom()
-                    } label: {
-                        Image(systemName: "trash")
+    private var timelineDeck: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            timelineResizeHandle
+            ZStack {
+                HStack(alignment: .center, spacing: 8) {
+                    jumpToStartButton
+                    transportClock
+                    Spacer(minLength: 8)
+                    timelineTools
+                }
+                playButton
+            }
+            .frame(height: 48)
+            if !editor.timelineHidden {
+                GeometryReader { geo in
+                    let contentW = max(geo.size.width, geo.size.width * editor.timelineZoom)
+                    ScrollView(.horizontal, showsIndicators: true) {
+                        TimelineStrip(editor: editor)
+                            .frame(width: contentW, height: editor.timelineHeight)
                     }
-                    .keyboardShortcut(.delete, modifiers: [])
-                    .help("Remove this zoom")
+                }
+                .frame(height: editor.timelineHeight)
+            }
+            editorChromeBar
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.white)
+        .overlay(Rectangle().fill(Frame.hairline).frame(height: 1), alignment: .top)
+    }
+
+    private var timelineResizeHandle: some View {
+        HStack {
+            Spacer()
+            Capsule()
+                .fill(Color.black.opacity(0.18))
+                .frame(width: 36, height: 4)
+            Spacer()
+        }
+        .frame(height: 12)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if timelineHeightBase == nil { timelineHeightBase = editor.timelineHeight }
+                    let next = (timelineHeightBase ?? 248) - value.translation.height
+                    editor.timelineHeight = min(420, max(96, next))
+                    if editor.timelineHeight <= 100 { editor.timelineHidden = false }
+                }
+                .onEnded { _ in timelineHeightBase = nil }
+        )
+        .help("Drag to make the timeline taller or shorter")
+    }
+
+    private var editorChromeBar: some View {
+        let canvasSize = engine.canvas.size(phoneAspect: engine.phoneAspect)
+        return HStack(spacing: 10) {
+            chromeMenu(title: "Canvas", value: "\(Int(canvasSize.width)) × \(Int(canvasSize.height))") {
+                ForEach(CanvasPreset.allCases) { preset in
+                    Button(preset.displayTitle) {
+                        engine.canvas = preset
+                        editor.refreshPreview(immediate: true)
+                    }
                 }
             }
-
-            Button {
-                editor.addZoom()
-            } label: {
-                Label("Add Zoom", systemImage: "plus.magnifyingglass")
-                    .font(.body.weight(.medium))
+            chromeMenu(title: "Fit", value: engine.phoneScale > 0.86 ? "Fill" : "Fit") {
+                Button("Fit") {
+                    engine.phoneScale = 0.78
+                    editor.refreshPreview(immediate: true)
+                }
+                Button("Fill") {
+                    engine.phoneScale = ExportLayout.phoneScaleMax
+                    editor.refreshPreview(immediate: true)
+                }
             }
-            .buttonStyle(.bordered)
-            .tint(accent)
-            .keyboardShortcut("z", modifiers: [.command, .shift])
-            .help("Drop a smooth zoom-in at the playhead, then drag the circle on the preview to aim it")
+            chromeMenu(title: "Style", value: styleName) {
+                ForEach(SolidSwatch.styleMenu) { swatch in
+                    Button(swatch.name) {
+                        engine.customBackgroundRGB = [swatch.rgb.0, swatch.rgb.1, swatch.rgb.2]
+                        editor.refreshPreview(immediate: true)
+                    }
+                }
+            } trailing: {
+                Circle()
+                    .fill(Color(red: engine.customBackgroundRGB?[safe: 0] ?? 1,
+                                green: engine.customBackgroundRGB?[safe: 1] ?? 1,
+                                blue: engine.customBackgroundRGB?[safe: 2] ?? 1))
+                    .frame(width: 10, height: 10)
+                    .overlay(Circle().strokeBorder(Color.black.opacity(0.15)))
+            }
+            Spacer()
+            Button { pickAndExport() } label: {
+                Label("Save", systemImage: "checkmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(Frame.save, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(!editor.isReady)
+            .help("Save the finished movie")
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Frame.surface, in: Capsule())
+        .overlay(Capsule().strokeBorder(Frame.pillStroke, lineWidth: 1))
+    }
+
+    private var styleName: String {
+        let rgb = (
+            engine.customBackgroundRGB?[safe: 0] ?? 1,
+            engine.customBackgroundRGB?[safe: 1] ?? 1,
+            engine.customBackgroundRGB?[safe: 2] ?? 1
+        )
+        if let named = (SolidSwatch.styleMenu + SolidSwatch.pastels + SolidSwatch.solids)
+            .first(where: {
+                abs($0.rgb.0 - rgb.0) < 0.04 && abs($0.rgb.1 - rgb.1) < 0.04 && abs($0.rgb.2 - rgb.2) < 0.04
+            }) {
+            return named.name
+        }
+        return "Custom"
+    }
+
+    private func chromeMenu<C: View, T: View>(
+        title: String, value: String, @ViewBuilder content: () -> C, @ViewBuilder trailing: () -> T
+    ) -> some View {
+        Menu(content: content) {
+            HStack(spacing: 6) {
+                Text("\(title)  \(value)")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Frame.label)
+                trailing()
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(Frame.tertiary)
+            }
+        }
+        .menuIndicator(.hidden)
+        .tint(Frame.label)
+        .fixedSize()
+    }
+
+    private func chromeMenu<C: View>(title: String, value: String, @ViewBuilder content: () -> C) -> some View {
+        chromeMenu(title: title, value: value, content: content, trailing: { EmptyView() })
+    }
+
+    private func clock(_ s: Double) -> String {
+        let t = max(0, s)
+        return String(format: "%02d:%02d", Int(t) / 60, Int(t) % 60)
     }
 
     private func exportOverlay(_ progress: Double) -> some View {
         ZStack {
-            Color.black.opacity(0.6)
+            Color.black.opacity(0.28)
             VStack(spacing: 14) {
-                ProgressView(value: progress).frame(width: 260)
-                Text("Exporting… \(Int(progress * 100))%")
-                    .font(.headline.monospacedDigit())
-                    .foregroundStyle(.white)
+                if editor.exportSucceeded || progress >= 0.999 {
+                    Image(systemName: "checkmark.circle.fill").font(.system(size: 36)).foregroundStyle(Frame.export)
+                    Text("Exported").font(.headline)
+                    Text(editor.exportedURL?.lastPathComponent ?? "Finishing…")
+                        .font(.callout).foregroundStyle(Frame.secondary)
+                } else {
+                    ProgressView(value: progress).frame(width: 240).tint(Frame.accent)
+                    Text("Exporting… \(Int(progress * 100))%")
+                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    Button("Cancel") { editor.cancelExport() }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Frame.secondary)
+                }
             }
             .padding(28)
-            .background(RoundedRectangle(cornerRadius: 14).fill(panel))
+            .background(Frame.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .shadow(radius: 24)
         }
     }
 }
 
-private func timeString(_ s: Double) -> String {
-    let t = max(0, Int(s.rounded()))
-    return String(format: "%d:%02d", t / 60, t % 60)
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
 }
 
-// MARK: - Timeline
-
-private struct TimelineStrip: View {
+/// Phone + camera as two layers — same layout as the live window.
+/// Avoids AVPlayer's custom compositor, which freezes the Mac.
+private struct DualReviewCanvas: View {
     @ObservedObject var editor: EditorState
-    @State private var dragBaseStart: [UUID: Double] = [:]
-    @State private var dragBaseDuration: [UUID: Double] = [:]
-    @State private var trimBase: [String: Double] = [:]
+    @ObservedObject var engine: CaptureEngine
+    @Binding var cameraSelected: Bool
+    @State private var resizeStart: CGFloat?
+    @State private var hoveringCamera = false
+    @AppStorage("recordiphone.didMoveCameraTip") private var didMoveCameraTip = false
 
     var body: some View {
         GeometryReader { geo in
-            let w = geo.size.width
-            let pps = w / max(editor.duration, 0.1)   // pixels per second
-
-            ZStack(alignment: .leading) {
-                // Film strip
-                RoundedRectangle(cornerRadius: 10).fill(panel)
-                HStack(spacing: 0) {
-                    ForEach(Array(editor.thumbnails.enumerated()), id: \.offset) { _, img in
-                        Image(decorative: img, scale: 1)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: w / CGFloat(max(editor.thumbnails.count, 1)),
-                                   height: geo.size.height)
-                            .clipped()
+            let size = geo.size
+            let layout: ExportLayout = {
+                var next = engine.currentLayout()
+                next.scenes = editor.scenes
+                return next
+            }()
+            let kind = layout.scene(at: editor.currentTime)
+            let showPhone = kind != .camera
+            let showCamera = kind != .device && engine.cameraEnabled && editor.hasCamera
+            let isSplit = engine.presenterLayout == .split
+            let t = editor.currentTime
+            let selected = editor.selectedZoom
+            let aiming = selected != nil && !editor.isPlaying
+            let activeZoom = editor.zooms
+                .filter { t >= $0.start && t <= $0.end }
+                .max(by: { $0.scale(at: t) < $1.scale(at: t) })
+            let zoomScale = aiming ? 1 : (activeZoom?.scale(at: t) ?? 1)
+            let phoneCenter = (aiming ? selected?.center : activeZoom?.center)
+                ?? CGPoint(x: 0.5, y: 0.45)
+            let presented = editor.player.currentItem?.presentationSize ?? .zero
+            let phoneAspect = presented.height > 1
+                ? presented.width / presented.height
+                : max(engine.phoneAspect, 0.3)
+            let screen = CanvasDraw.phoneScreenRect(
+                canvas: size, layout: layout, phoneAspect: phoneAspect)
+            let canvasAim = CanvasDraw.canvasUnit(
+                fromPhone: phoneCenter, screen: screen, canvas: size)
+            ZStack {
+                canvasFill
+                    .contentShape(Rectangle())
+                    .onTapGesture { cameraSelected = false }
+                if isSplit {
+                    ZStack {
+                        if showPhone {
+                            phoneLayer(screen: screen, zoomScale: 1,
+                                       zoomAnchor: .center, aiming: aiming)
+                        }
+                        if showCamera {
+                            cameraLayer(in: size, layout: layout)
+                        }
+                    }
+                    .frame(width: size.width, height: size.height)
+                    .scaleEffect(zoomScale, anchor: UnitPoint(x: canvasAim.x, y: canvasAim.y))
+                } else {
+                    if showPhone {
+                        phoneLayer(screen: screen,
+                                   zoomScale: zoomScale,
+                                   zoomAnchor: UnitPoint(x: phoneCenter.x, y: phoneCenter.y),
+                                   aiming: aiming)
+                    }
+                    if showCamera {
+                        cameraLayer(in: size, layout: layout)
                     }
                 }
-                .opacity(0.5)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .coordinateSpace(name: "reviewCanvas")
+        }
+    }
 
-                // Dim the trimmed-away ends
-                Rectangle().fill(.black.opacity(0.62))
-                    .frame(width: max(0, editor.trimStart * pps))
-                Rectangle().fill(.black.opacity(0.62))
-                    .frame(width: max(0, (editor.duration - editor.trimEnd) * pps))
-                    .offset(x: editor.trimEnd * pps)
+    private var canvasFill: some View {
+        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background)
+    }
 
-                // Zoom chips
-                ForEach(editor.zooms) { zoom in
-                    zoomChip(zoom, pps: pps, height: geo.size.height)
+    private func phoneLayer(screen: CGRect, zoomScale: CGFloat,
+                            zoomAnchor: UnitPoint, aiming: Bool) -> some View {
+        let w = screen.width
+        let h = screen.height
+        let selected = editor.selectedZoom
+        return FramedPhoneChrome(
+            width: w,
+            height: h,
+            style: engine.frameStyle,
+            showBezel: engine.frameStyle.showsBezel,
+            screenCorners: engine.screenCorners
+        ) {
+            PlayerContainerView(player: editor.player, gravity: .resizeAspectFill)
+                .id("phone-player")
+                .allowsHitTesting(false)
+        }
+        .scaleEffect(zoomScale, anchor: zoomAnchor)
+        .overlay {
+            if aiming, let selected {
+                Circle()
+                    .strokeBorder(Frame.accent, lineWidth: 2)
+                    .background(Circle().fill(Frame.accent.opacity(0.18)))
+                    .frame(width: 22, height: 22)
+                    .position(x: selected.center.x * w, y: selected.center.y * h)
+            }
+        }
+        .contentShape(Rectangle())
+        .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+            guard let id = editor.selectedZoomID, !editor.isPlaying else { return }
+            editor.setZoomCenter(id, center: CGPoint(
+                x: value.location.x / max(w, 1),
+                y: value.location.y / max(h, 1)))
+        }.onEnded { _ in
+            if editor.selectedZoomID != nil { editor.refreshPreview(immediate: true) }
+        })
+        .position(x: screen.midX, y: screen.midY)
+    }
+
+    private func cameraLayer(in size: CGSize, layout: ExportLayout) -> some View {
+        let frac = min(max(engine.bubbleFraction, ExportLayout.bubbleMin), ExportLayout.bubbleMax)
+        let aspect: CGFloat = engine.cameraShape == .rectangle ? 4 / 5 : 1
+        let (w, h, center, corner): (CGFloat, CGFloat, CGPoint, CGFloat) = {
+            switch engine.presenterLayout {
+            case .floating:
+                let s = frac * min(size.width, size.height)
+                let cr: CGFloat = engine.cameraShape == .circle ? 0.5
+                    : (engine.cameraShape == .square ? 0.18 : 0.14)
+                return (s * aspect, s, engine.bubbleCenter, cr)
+            case .split:
+                let zone = ExportLayout.splitZones(canvas: size, layout: layout).camera
+                let fit = min(zone.width / aspect, zone.height) * 0.92
+                let cr: CGFloat = engine.cameraShape == .circle ? 0.5 : 0.10
+                return (fit * aspect, fit,
+                        CGPoint(x: zone.midX / size.width, y: zone.midY / size.height), cr)
+            }
+        }()
+        let ring = engine.ringRGB
+        let ringColor = Color(red: ring.indices.contains(0) ? ring[0] : 1,
+                              green: ring.indices.contains(1) ? ring[1] : 1,
+                              blue: ring.indices.contains(2) ? ring[2] : 1)
+        let highlighted = cameraSelected || hoveringCamera
+        return PlayerContainerView(player: editor.cameraPlayer, gravity: .resizeAspectFill)
+            .allowsHitTesting(false)
+            .frame(width: w, height: h)
+            .clipShape(RoundedRectangle(cornerRadius: min(w, h) * corner, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: min(w, h) * corner, style: .continuous)
+                    .strokeBorder(ringColor, lineWidth: max(2, min(w, h) * 0.018))
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: min(w, h) * corner, style: .continuous)
+                    .strokeBorder(highlighted ? Frame.accent : Color.white.opacity(0.35),
+                                  lineWidth: cameraSelected ? 2.5 : 1.5)
+            }
+            .overlay { resizeHandles(canvas: size, width: w, height: h) }
+            .background {
+                RoundedRectangle(cornerRadius: min(w, h) * corner, style: .continuous)
+                    .fill(Color.black.opacity(0.001))
+            }
+            .overlay {
+                if engine.showBorder {
+                    RoundedRectangle(cornerRadius: min(w, h) * corner, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.9), lineWidth: 2)
                 }
-
-                // Trim handles — drag by relative motion (the handle's own
-                // coordinate space is only 7pt wide, so absolute positions lie)
-                trimHandle(x: editor.trimStart * pps, height: geo.size.height,
-                           key: "start", current: editor.trimStart, pps: pps) { seconds in
-                    editor.trimStart = min(max(0, seconds), editor.trimEnd - 1)
-                    editor.applyTrimToPlayback()
-                }
-                trimHandle(x: editor.trimEnd * pps, height: geo.size.height,
-                           key: "end", current: editor.trimEnd, pps: pps) { seconds in
-                    editor.trimEnd = max(min(editor.duration, seconds), editor.trimStart + 1)
-                    editor.applyTrimToPlayback()
-                }
-
-                // Playhead
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(.white)
-                    .frame(width: 2, height: geo.size.height + 8)
-                    .offset(x: editor.currentTime * pps - 1, y: -4)
-                    .shadow(radius: 2)
             }
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                editor.seek(to: value.location.x / pps)
-                editor.selectedZoomID = nil
-            })
-        }
-    }
-
-    private func zoomChip(_ zoom: ZoomSegment, pps: CGFloat, height: CGFloat) -> some View {
-        let selected = editor.selectedZoomID == zoom.id
-        return HStack(spacing: 4) {
-            Image(systemName: "plus.magnifyingglass").font(.system(size: 10, weight: .bold))
-            Text(String(format: "%.1f×", zoom.level)).font(.caption2.weight(.semibold).monospacedDigit())
-            Spacer(minLength: 0)
-            // Right-edge grip: drag to change the zoom's length
-            RoundedRectangle(cornerRadius: 2)
-                .fill(.white.opacity(selected ? 0.9 : 0.4))
-                .frame(width: 5, height: 26)
-                .gesture(DragGesture(minimumDistance: 1)
+            .onHover { hoveringCamera = $0 }
+            .gesture(
+                DragGesture(minimumDistance: 2, coordinateSpace: .named("reviewCanvas"))
                     .onChanged { value in
-                        if dragBaseDuration[zoom.id] == nil { dragBaseDuration[zoom.id] = zoom.duration }
-                        var z = zoom
-                        z.duration = (dragBaseDuration[zoom.id] ?? z.duration) + value.translation.width / pps
-                        editor.update(z)
+                        cameraSelected = true
+                        guard engine.presenterLayout == .floating else { return }
+                        engine.bubbleCenter = CGPoint(
+                            x: min(max(value.location.x / max(size.width, 1), 0.08), 0.92),
+                            y: min(max(value.location.y / max(size.height, 1), 0.08), 0.92))
                     }
-                    .onEnded { _ in dragBaseDuration[zoom.id] = nil })
-        }
-        .padding(.horizontal, 6)
-        .foregroundStyle(.white)
-        .frame(width: max(34, zoom.duration * pps), height: 34)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(LinearGradient(colors: [accent, accent.opacity(0.75)],
-                                     startPoint: .top, endPoint: .bottom))
-        )
-        .overlay(RoundedRectangle(cornerRadius: 8)
-            .stroke(.white, lineWidth: selected ? 2 : 0))
-        .offset(x: zoom.start * pps)
-        .onTapGesture { editor.selectedZoomID = zoom.id; editor.seek(to: zoom.start + 0.7) }
-        .gesture(DragGesture(minimumDistance: 2)
-            .onChanged { value in
-                if dragBaseStart[zoom.id] == nil { dragBaseStart[zoom.id] = zoom.start }
-                var z = zoom
-                z.start = (dragBaseStart[zoom.id] ?? z.start) + value.translation.width / pps
-                editor.update(z)
-                editor.selectedZoomID = zoom.id
-            }
-            .onEnded { _ in dragBaseStart[zoom.id] = nil })
-        .help("Drag to move the zoom; drag the grip to change its length")
+                    .onEnded { _ in
+                        didMoveCameraTip = true
+                        editor.commitBubbleMove()
+                    }
+            )
+            .onTapGesture { cameraSelected = true }
+            .help(engine.presenterLayout == .floating ? "Drag to move the camera" : "Camera")
+            .position(x: center.x * size.width, y: center.y * size.height)
     }
 
-    private func trimHandle(x: CGFloat, height: CGFloat, key: String,
-                            current: Double, pps: CGFloat,
-                            onDrag: @escaping (Double) -> Void) -> some View {
-        RoundedRectangle(cornerRadius: 3)
-            .fill(.white)
-            .frame(width: 7, height: height + 6)
-            .overlay(RoundedRectangle(cornerRadius: 1).fill(.black.opacity(0.35)).frame(width: 1.5, height: 18))
-            .offset(x: x - 3.5, y: -3)
-            .gesture(DragGesture(minimumDistance: 1)
-                .onChanged { value in
-                    if trimBase[key] == nil { trimBase[key] = current }
-                    onDrag((trimBase[key] ?? current) + value.translation.width / pps)
-                }
-                .onEnded { _ in trimBase[key] = nil })
-            .help("Drag to trim")
+    @ViewBuilder
+    private func resizeHandles(canvas: CGSize, width: CGFloat, height: CGFloat) -> some View {
+        if cameraSelected, engine.presenterLayout == .floating {
+            let corners: [Alignment] = [.topLeading, .topTrailing, .bottomLeading, .bottomTrailing]
+            ForEach(Array(corners.enumerated()), id: \.offset) { _, align in
+                handleDot
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: align)
+                    .offset(x: align == .topLeading || align == .bottomLeading ? -5 : 5,
+                            y: align == .topLeading || align == .topTrailing ? -5 : 5)
+                    .highPriorityGesture(resizeGesture(canvas: canvas, invert: align == .topLeading))
+            }
+        }
+    }
+
+    private var handleDot: some View {
+        Circle()
+            .fill(Color.white)
+            .overlay(Circle().strokeBorder(Frame.accent, lineWidth: 2))
+            .frame(width: 12, height: 12)
+    }
+
+    private func resizeGesture(canvas: CGSize, invert: Bool) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                cameraSelected = true
+                if resizeStart == nil { resizeStart = engine.bubbleFraction }
+                let raw = (value.translation.width + value.translation.height) / 2
+                let delta = invert ? -raw : raw
+                let next = (resizeStart ?? engine.bubbleFraction)
+                    + delta / max(min(canvas.width, canvas.height), 1)
+                engine.bubbleFraction = min(max(next, ExportLayout.bubbleMin), ExportLayout.bubbleMax)
+            }
+            .onEnded { _ in
+                resizeStart = nil
+                didMoveCameraTip = true
+                editor.commitBubbleMove()
+            }
+    }
+
+}
+
+/// Plain player layer — AVPlayerView can steal the audio device so the
+/// iPhone player goes silent when the camera player is also on screen.
+private struct PlayerContainerView: NSViewRepresentable {
+    let player: AVPlayer
+    var gravity: AVLayerVideoGravity = .resizeAspectFill
+    func makeNSView(context: Context) -> PlayerLayerNSView {
+        let v = PlayerLayerNSView()
+        v.player = player
+        v.gravity = gravity
+        return v
+    }
+    func updateNSView(_ nsView: PlayerLayerNSView, context: Context) {
+        nsView.player = player
+        nsView.gravity = gravity
     }
 }
 
-/// AVPlayerView without its own controls — the editor supplies transport UI.
-private struct PlayerContainerView: NSViewRepresentable {
-    let player: AVPlayer
-    func makeNSView(context: Context) -> AVPlayerView {
-        let v = AVPlayerView()
-        v.player = player
-        v.controlsStyle = .none
-        v.videoGravity = .resizeAspect
-        return v
+final class PlayerLayerNSView: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        let playerLayer = AVPlayerLayer()
+        playerLayer.videoGravity = .resizeAspectFill
+        layer = playerLayer
     }
-    func updateNSView(_ nsView: AVPlayerView, context: Context) {}
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    var player: AVPlayer? {
+        get { (layer as? AVPlayerLayer)?.player }
+        set { (layer as? AVPlayerLayer)?.player = newValue }
+    }
+
+    var gravity: AVLayerVideoGravity = .resizeAspectFill {
+        didSet { (layer as? AVPlayerLayer)?.videoGravity = gravity }
+    }
+}
+
+/// ⌘-scroll zooms the timeline. Regular scroll still pans when zoomed in.
+private struct CommandScrollCatcher: NSViewRepresentable {
+    var onZoom: (Double) -> Void
+
+    func makeNSView(context: Context) -> Catcher {
+        let view = Catcher()
+        view.onZoom = onZoom
+        return view
+    }
+
+    func updateNSView(_ nsView: Catcher, context: Context) {
+        nsView.onZoom = onZoom
+    }
+
+    final class Catcher: NSView {
+        var onZoom: (Double) -> Void = { _ in }
+
+        override func scrollWheel(with event: NSEvent) {
+            if event.modifierFlags.contains(.command) {
+                let delta = event.scrollingDeltaY
+                guard abs(delta) > 0.2 else { return }
+                onZoom(delta > 0 ? 1.12 : 1 / 1.12)
+                return
+            }
+            super.scrollWheel(with: event)
+        }
+    }
 }
