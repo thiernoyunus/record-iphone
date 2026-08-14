@@ -20,6 +20,7 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <net/if_dl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -30,6 +31,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -145,6 +147,12 @@ static void *video_connect_thread(void *arg) {
         if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
         int snd = 2 * 1024 * 1024;
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
+        int nosigpipe = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe)) != 0) {
+            close(fd);
+            usleep(100000);
+            continue;
+        }
         pthread_mutex_lock(&g_video_lock);
         if (g_video_fd >= 0) close(g_video_fd);
         g_video_fd = fd;
@@ -153,6 +161,40 @@ static void *video_connect_thread(void *arg) {
         fprintf(stderr, "video socket connected\n");
     }
     return NULL;
+}
+
+/* Write the whole iovec. Returns 0 on success, 1 to drop a still-unsent
+   frame (EAGAIN with nothing written), -1 for a fatal write that must
+   close the socket so the receiver stays aligned. */
+static int writev_all(int fd, struct iovec *iov, int iovcnt, size_t total) {
+    size_t sent = 0;
+    while (sent < total) {
+        ssize_t w = writev(fd, iov, iovcnt);
+        if (w > 0) {
+            size_t skip = (size_t)w;
+            sent += skip;
+            while (skip && iovcnt > 0) {
+                if (skip >= iov[0].iov_len) {
+                    skip -= iov[0].iov_len;
+                    iov++;
+                    iovcnt--;
+                } else {
+                    iov[0].iov_base = (char *)iov[0].iov_base + skip;
+                    iov[0].iov_len -= skip;
+                    skip = 0;
+                }
+            }
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (sent == 0) return 1;
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            if (poll(&pfd, 1, 50) > 0) continue;
+        }
+        return -1;
+    }
+    return 0;
 }
 
 static void emit_video(const void *payload, uint32_t len) {
@@ -167,13 +209,17 @@ static void emit_video(const void *payload, uint32_t len) {
         pthread_mutex_unlock(&g_video_lock);
         return;
     }
-    ssize_t a = write(fd, header, 5);
-    ssize_t b = (a == 5) ? write(fd, payload, len) : -1;
-    if (a != 5 || b != (ssize_t)len) {
+    struct iovec iov[2] = {
+        { .iov_base = header, .iov_len = 5 },
+        { .iov_base = (void *)payload, .iov_len = len },
+    };
+    int wr = writev_all(fd, iov, 2, 5 + (size_t)len);
+    if (wr == 1) {
+        file_log("video socket backpressure — dropped frame");
+    } else if (wr < 0) {
         close(fd);
         g_video_fd = -1;
-        file_log("video socket write failed a=%zd b=%zd errno=%d — dropped frame",
-                 a, b, errno);
+        file_log("video socket write failed errno=%d — dropped frame", errno);
     }
     pthread_mutex_unlock(&g_video_lock);
 }
@@ -324,13 +370,31 @@ static void display_pin_cb(void *cls, char *pin) {
 static char g_clients_path[1100] = {0};
 static bool check_register_cb(void *cls, const char *pk_str);
 
+static bool field_is_safe(const char *s) {
+    if (!s) return true;
+    for (size_t i = 0; s[i]; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == '\t' || c == 0x7f) return false;
+    }
+    return true;
+}
+
 static void register_client_cb(void *cls, const char *device_id, const char *pk_str, const char *name) {
     (void)cls;
     file_log("register client %s id=%s", name ? name : "?", device_id ? device_id : "?");
     if (!g_clients_path[0] || !pk_str) return;
+    if (!field_is_safe(pk_str) || !field_is_safe(device_id) || !field_is_safe(name)) {
+        file_log("rejected client record with control characters");
+        return;
+    }
     if (check_register_cb(NULL, pk_str)) return;
-    FILE *fp = fopen(g_clients_path, "a");
-    if (!fp) return;
+    int fd = open(g_clients_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return;
+    FILE *fp = fdopen(fd, "a");
+    if (!fp) {
+        close(fd);
+        return;
+    }
     fprintf(fp, "%s\t%s\t%s\n", pk_str, device_id ? device_id : "", name ? name : "");
     fclose(fp);
 }
@@ -403,7 +467,7 @@ static float on_video_playlist_remove_cb(void *cls) {
 }
 
 static void apply_features(dnssd_t *dnssd) {
-    /* Match UxPlay's mirror-oriented feature bits. HLS off, h265 off. */
+    /* Match UxPlay's mirror-oriented feature bits. HLS off, HEVC on (bit 42). */
     dnssd_set_airplay_features(dnssd, 0, 0);
     dnssd_set_airplay_features(dnssd, 1, 1);
     dnssd_set_airplay_features(dnssd, 2, 1);
@@ -468,11 +532,14 @@ static void find_mac(char *out, size_t out_len) {
 
 static void random_mac(char *out, size_t out_len) {
     unsigned char b[6];
+    size_t got = 0;
     FILE *ur = fopen("/dev/urandom", "rb");
     if (ur) {
-        fread(b, 1, 6, ur);
+        got = fread(b, 1, 6, ur);
         fclose(ur);
-    } else {
+    }
+    if (got != 6) {
+        /* Local device id only, not a secret. rand() is fine here. */
         srand((unsigned)time(NULL) ^ (unsigned)getpid());
         for (int i = 0; i < 6; i++) b[i] = (unsigned char)(rand() & 0xff);
     }
@@ -500,6 +567,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IOLBF, 0);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGPIPE, SIG_IGN);
 
     char support[1024];
     if (!key_dir) {
@@ -520,7 +588,10 @@ int main(int argc, char **argv) {
     file_log("---- helper start name=%s sock=%s ----", name, g_sock_path);
 
     pthread_t video_thr;
-    pthread_create(&video_thr, NULL, video_connect_thread, NULL);
+    if (pthread_create(&video_thr, NULL, video_connect_thread, NULL) != 0) {
+        emit_event_fmt("{\"type\":\"error\",\"message\":\"Could not start the video transport.\"}");
+        return 1;
+    }
     pthread_detach(video_thr);
 
     char mac[32];
@@ -628,7 +699,6 @@ int main(int argc, char **argv) {
     while (!g_stop) sleep(1);
 
     close_video_fd();
-    if (g_log) { fclose(g_log); g_log = NULL; }
     if (g_dnssd) {
         dnssd_unregister_raop(g_dnssd);
         dnssd_unregister_airplay(g_dnssd);
@@ -639,5 +709,6 @@ int main(int argc, char **argv) {
         raop_destroy(g_raop);
         g_raop = NULL;
     }
+    if (g_log) { fclose(g_log); g_log = NULL; }
     return 0;
 }
