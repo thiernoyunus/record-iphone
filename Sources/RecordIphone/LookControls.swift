@@ -79,6 +79,7 @@ struct LookControls: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel(Self.cameraPositionName(x: x, y: y))
+                        .accessibilityAddTraits(on ? .isSelected : [])
                     }
                 }
 

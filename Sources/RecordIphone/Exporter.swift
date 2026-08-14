@@ -455,8 +455,15 @@ enum Exporter {
             let phoneVol = Float(min(max(phoneAudioLevel, 0), 1))
             let micVol = Float(min(max(micAudioLevel, 0), 1))
             var leveled: [(AVURLAsset, CMTime, Float, CMTime)] = [(phoneAsset, phoneAt, phoneVol, phoneSkip)]
-            if let sidecar = await joinedPhoneAudioURL(in: readyPhone.deletingLastPathComponent()) {
+            let takeDir = readyPhone.deletingLastPathComponent()
+            if let sidecar = await joinedPhoneAudioURL(in: takeDir) {
                 leveled.append((AVURLAsset(url: sidecar), phoneAt, phoneVol, phoneSkip))
+            } else {
+                let parts = PhoneAudioSegments.urls(in: takeDir)
+                if AudioJoinPolicy.fallback(partCount: parts.count) == .refusePartial {
+                    leveled.append(contentsOf: await sequentialAudioSources(
+                        parts, start: phoneAt, skip: phoneSkip, volume: phoneVol))
+                }
             }
             if let cameraAsset { leveled.append((cameraAsset, cameraAt, micVol, cameraSkip)) }
             guard let mixedURL = try await mixAudio(sources: leveled, into: mixedAudio),
@@ -756,38 +763,91 @@ enum Exporter {
         let parts = PhoneAudioSegments.urls(in: dir)
         guard !parts.isEmpty else { return nil }
         if parts.count == 1 { return parts[0] }
-        return await concatMovies(parts, into: dir.appendingPathComponent("phone-audio.joined.m4a")) ?? parts[0]
+        let dest = dir.appendingPathComponent("phone-audio.joined.m4a")
+        if let joined = await concatMovies(parts, into: dest) { return joined }
+        let sources = await sequentialAudioSources(parts, start: .zero, skip: .zero, volume: 1)
+        return try? await mixAudio(sources: sources, into: dest)
+    }
+
+    /// Laid end to end so a format-change `phone-audio-2.m4a` keeps speaking
+    /// after the first file, even when we cannot write a joined sidecar.
+    static func sequentialAudioSources(_ urls: [URL], start: CMTime, skip: CMTime, volume: Float)
+    async -> [(AVURLAsset, CMTime, Float, CMTime)] {
+        var result: [(AVURLAsset, CMTime, Float, CMTime)] = []
+        var cursor = start
+        var remainingSkip = skip
+        let precise: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: true]
+        for url in urls {
+            let asset = AVURLAsset(url: url, options: precise)
+            let dur = (try? await asset.load(.duration)) ?? .zero
+            guard dur.seconds > 0.05 else { continue }
+            if remainingSkip.seconds >= dur.seconds - 0.05 {
+                remainingSkip = CMTimeSubtract(remainingSkip, dur)
+                continue
+            }
+            result.append((asset, cursor, volume, remainingSkip))
+            cursor = CMTime(seconds: AudioJoinPolicy.nextStart(
+                current: cursor.seconds, duration: dur.seconds, skip: remainingSkip.seconds),
+                            preferredTimescale: 600)
+            remainingSkip = .zero
+        }
+        return result
+    }
+
+    private static var ffmpegPath: String? {
+        ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     private static func muxVideo(_ video: URL, audio: URL, into dest: URL) async -> URL? {
-        let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-            .first { FileManager.default.isExecutableFile(atPath: $0) }
-        guard let ffmpeg else { return nil }
-        try? FileManager.default.removeItem(at: dest)
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: ffmpeg)
-        proc.arguments = [
-            "-hide_banner", "-loglevel", "error",
-            "-y", "-i", video.path, "-i", audio.path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c", "copy", dest.path
-        ]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
+        if let ffmpeg = ffmpegPath {
+            try? FileManager.default.removeItem(at: dest)
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: ffmpeg)
+            proc.arguments = [
+                "-hide_banner", "-loglevel", "error",
+                "-y", "-i", video.path, "-i", audio.path,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c", "copy", dest.path
+            ]
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            do {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    proc.terminationHandler = { _ in cont.resume() }
+                    do { try proc.run() } catch { cont.resume(throwing: error) }
+                }
+            } catch {
+                /* fall through to the in-app mux */
+            }
+            let size = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if size > 1024 { return dest }
+        }
+        return await muxVideoAV(video, audio: audio, into: dest)
+    }
+
+    private static func muxVideoAV(_ video: URL, audio: URL, into dest: URL) async -> URL? {
+        let composition = AVMutableComposition()
+        let precise: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: true]
         do {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                proc.terminationHandler = { _ in cont.resume() }
-                do { try proc.run() } catch { cont.resume(throwing: error) }
+            guard try await addTrack(from: AVURLAsset(url: video, options: precise),
+                                     type: .video, to: composition, at: .zero) != nil,
+                  try await addTrack(from: AVURLAsset(url: audio, options: precise),
+                                     type: .audio, to: composition, at: .zero) != nil else {
+                return nil
             }
         } catch { return nil }
-        let size = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        return size > 1024 ? dest : nil
+        return await exportComposition(composition, to: dest, audioOnly: false)
     }
 
     private static func concatMovies(_ urls: [URL], into dest: URL) async -> URL? {
-        let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-            .first { FileManager.default.isExecutableFile(atPath: $0) }
-        guard let ffmpeg, urls.count > 1 else { return nil }
+        guard urls.count > 1 else { return nil }
+        if let joined = await concatMoviesFFmpeg(urls, into: dest) { return joined }
+        return await concatMoviesAV(urls, into: dest)
+    }
+
+    private static func concatMoviesFFmpeg(_ urls: [URL], into dest: URL) async -> URL? {
+        guard let ffmpeg = ffmpegPath else { return nil }
         let list = dest.deletingLastPathComponent()
             .appendingPathComponent("phone.concat-\(UUID().uuidString).txt")
         let body = urls.map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }
@@ -816,6 +876,77 @@ enum Exporter {
         }
         let size = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         return size > 1024 ? dest : nil
+    }
+
+    private static func concatMoviesAV(_ urls: [URL], into dest: URL) async -> URL? {
+        let comp = AVMutableComposition()
+        var videoTrack: AVMutableCompositionTrack?
+        var audioTrack: AVMutableCompositionTrack?
+        var cursor = CMTime.zero
+        let precise: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: true]
+        for url in urls {
+            let asset = AVURLAsset(url: url, options: precise)
+            let duration = (try? await asset.load(.duration)) ?? .zero
+            guard duration.seconds > 0.05 else { continue }
+            if let src = try? await asset.loadTracks(withMediaType: .video).first {
+                if videoTrack == nil {
+                    videoTrack = comp.addMutableTrack(withMediaType: .video,
+                                                      preferredTrackID: kCMPersistentTrackID_Invalid)
+                }
+                if let videoTrack {
+                    let range = (try? await src.load(.timeRange)).flatMap { $0.duration.seconds > 0.05 ? $0 : nil }
+                        ?? CMTimeRange(start: .zero, duration: duration)
+                    try? videoTrack.insertTimeRange(range, of: src, at: cursor)
+                }
+            }
+            if let src = try? await asset.loadTracks(withMediaType: .audio).first {
+                if audioTrack == nil {
+                    audioTrack = comp.addMutableTrack(withMediaType: .audio,
+                                                      preferredTrackID: kCMPersistentTrackID_Invalid)
+                }
+                if let audioTrack {
+                    let range = (try? await src.load(.timeRange)).flatMap { $0.duration.seconds > 0.05 ? $0 : nil }
+                        ?? CMTimeRange(start: .zero, duration: duration)
+                    try? audioTrack.insertTimeRange(range, of: src, at: cursor)
+                }
+            }
+            cursor = CMTimeAdd(cursor, duration)
+        }
+        guard cursor.seconds > 0.05 else { return nil }
+        return await exportComposition(comp, to: dest, audioOnly: videoTrack == nil)
+    }
+
+    private static func exportComposition(_ asset: AVAsset, to dest: URL, audioOnly: Bool) async -> URL? {
+        let presets: [(String, AVFileType)] = audioOnly
+            ? [(AVAssetExportPresetAppleM4A, .m4a)]
+            : [(AVAssetExportPresetPassthrough, .mov),
+               (AVAssetExportPresetHEVCHighestQuality, .mov),
+               (AVAssetExportPresetHighestQuality, .mov)]
+        for (preset, type) in presets {
+            try? FileManager.default.removeItem(at: dest)
+            guard let session = AVAssetExportSession(asset: asset, presetName: preset) else { continue }
+            do {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        try await session.export(to: dest, as: type)
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: .seconds(30))
+                        session.cancelExport()
+                        throw ExportError.exportSetup
+                    }
+                    _ = try await group.next()
+                    group.cancelAll()
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: dest)
+                continue
+            }
+            let size = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if size > 1024 { return dest }
+            try? FileManager.default.removeItem(at: dest)
+        }
+        return nil
     }
 
     /// Stream-copy remux via ffmpeg when available (Homebrew).

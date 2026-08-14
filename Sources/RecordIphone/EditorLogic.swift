@@ -183,6 +183,23 @@ enum PhoneWriterPolicy {
     }
 }
 
+/// How to treat rolled `phone-audio.m4a` + `phone-audio-2.m4a` when a glue
+/// step fails. Never keep only the first file if later files exist.
+enum AudioJoinPolicy {
+    enum Fallback: Equatable {
+        case singleFile
+        case refusePartial
+    }
+
+    static func fallback(partCount: Int) -> Fallback {
+        partCount > 1 ? .refusePartial : .singleFile
+    }
+
+    static func nextStart(current: Double, duration: Double, skip: Double) -> Double {
+        current + max(0, duration - max(0, skip))
+    }
+}
+
 enum PhoneSegments {
     static func fileName(index: Int) -> String {
         index <= 1 ? "phone.mov" : "phone-\(index).mov"
@@ -464,6 +481,12 @@ enum EditorLogicTests {
                                        deviceConnected: true, sessionRunning: true) == .ignore)
         expect("first phone part is phone.mov", PhoneSegments.fileName(index: 1) == "phone.mov")
         expect("second phone part is phone-2.mov", PhoneSegments.fileName(index: 2) == "phone-2.mov")
+        expect("one audio file can be used as-is",
+               AudioJoinPolicy.fallback(partCount: 1) == .singleFile)
+        expect("two audio files must not fall back to only the first",
+               AudioJoinPolicy.fallback(partCount: 2) == .refusePartial)
+        expect("second audio piece starts after the first minus skip",
+               abs(AudioJoinPolicy.nextStart(current: 1.0, duration: 10, skip: 0.5) - 10.5) < 0.001)
         expect("turning the camera on also records your voice",
                SoundPolicy.modeWhenTurningCameraOn(current: .device) == .both)
 

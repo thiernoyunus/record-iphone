@@ -918,12 +918,12 @@ final class EditorState: ObservableObject {
     private func loadWaveform() async {
         // Decode off the main thread — a long take would otherwise freeze the UI.
         let phoneURL = playbackPhoneURL
-        let sidecar = PhoneAudioSegments.urls(in: dir).first
+        let sidecars = PhoneAudioSegments.urls(in: dir)
         let micURL = hasMic ? playbackCameraURL : nil
         let pair = await Task.detached(priority: .utility) {
             var phone = await Self.computeWaveform(url: phoneURL)
-            if phone.0.isEmpty, let sidecar {
-                phone = await Self.computeWaveform(url: sidecar)
+            if phone.0.isEmpty, !sidecars.isEmpty {
+                phone = await Self.computeWaveform(urls: sidecars)
             }
             let mic: ([Float], Double)
             if let micURL, micURL.standardizedFileURL != phoneURL.standardizedFileURL {
@@ -954,8 +954,33 @@ final class EditorState: ObservableObject {
         }
     }
 
+    nonisolated private static func computeWaveform(urls: [URL]) async -> ([Float], Double) {
+        if urls.isEmpty { return ([], 0) }
+        if urls.count == 1 { return await computeWaveform(url: urls[0]) }
+        let comp = AVMutableComposition()
+        var cursor = CMTime.zero
+        for url in urls {
+            let asset = AVURLAsset(url: url)
+            guard let src = try? await asset.loadTracks(withMediaType: .audio).first,
+                  let range = try? await src.load(.timeRange),
+                  range.duration.seconds > 0.05,
+                  let dest = comp.addMutableTrack(withMediaType: .audio,
+                                                  preferredTrackID: kCMPersistentTrackID_Invalid)
+            else { continue }
+            do {
+                try dest.insertTimeRange(range, of: src, at: cursor)
+                cursor = CMTimeAdd(cursor, range.duration)
+            } catch { continue }
+        }
+        guard cursor.seconds > 0.05 else { return ([], 0) }
+        return await computeWaveform(asset: comp)
+    }
+
     nonisolated private static func computeWaveform(url: URL) async -> ([Float], Double) {
-        let asset = AVURLAsset(url: url)
+        await computeWaveform(asset: AVURLAsset(url: url))
+    }
+
+    nonisolated private static func computeWaveform(asset: AVAsset) async -> ([Float], Double) {
         let fileDuration = (try? await asset.load(.duration).seconds) ?? 0
         guard let track = try? await asset.loadTracks(withMediaType: .audio).first else { return ([], fileDuration) }
         let buckets = 240
