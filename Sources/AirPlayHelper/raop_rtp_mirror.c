@@ -969,15 +969,34 @@ raop_rtp_mirror_thread(void *arg)
                             payload_decrypted = payload_out;
                         }
                         {
-                            /* Decrypt into a private buffer, then accept the
-                               trailer only if the NAL layout is complete.
-                               mirror_buffer_decrypt still advances the shared
-                               AES-CTR stream; rejected trailers can desync it. */
-                            mirror_buffer_decrypt(raop_rtp_mirror->buffer, trailer,
+                            /* Decrypt a copy. Restore the shared AES-CTR
+                               stream if the trailer is not a real video NAL. */
+                            unsigned char *enc = (unsigned char *) malloc((size_t)trailer_len);
+                            if (!enc) {
+                                logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
+                                           "raop_rtp_mirror type-5 trailer copy failed");
+                                free(payload_out);
+                                break;
+                            }
+                            memcpy(enc, trailer, (size_t)trailer_len);
+                            mirror_buffer_snap_t *snap = mirror_buffer_snapshot(raop_rtp_mirror->buffer);
+                            if (!snap) {
+                                logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
+                                           "raop_rtp_mirror type-5 trailer cipher snapshot failed");
+                                free(enc);
+                                free(payload_out);
+                                break;
+                            }
+                            mirror_buffer_decrypt(raop_rtp_mirror->buffer, enc,
                                                   payload_decrypted, trailer_len);
+                            free(enc);
                             int nalus_count = 0;
                             bool valid_data = mirror_nal_stream_valid(payload_decrypted,
                                                                       trailer_len, &nalus_count);
+                            if (!valid_data) {
+                                mirror_buffer_restore(raop_rtp_mirror->buffer, snap);
+                            }
+                            mirror_buffer_snap_destroy(snap);
                             if (valid_data) {
                                 int nalu_size = 0;
                                 while (nalu_size < trailer_len) {
