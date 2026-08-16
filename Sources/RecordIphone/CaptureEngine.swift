@@ -130,6 +130,8 @@ final class CaptureEngine: NSObject, ObservableObject {
     @Published var screenCorners = true
     @Published var showBorder = false
     @Published var customBackgroundRGB: [CGFloat]? = [1, 1, 1]
+    /// Bundled wallpaper id. When set, the picture wins over the solid color.
+    @Published var wallpaperID: String? = nil
     @Published var deviceOnLeft = true
     @Published var cameraLeads = false
     @Published var overlapArrangement = false
@@ -1642,6 +1644,7 @@ final class CaptureEngine: NSObject, ObservableObject {
             screenCorners: screenCorners,
             showBorder: showBorder,
             customBackgroundRGB: customBackgroundRGB,
+            wallpaperID: wallpaperID,
             cameraEnabled: cameraEnabled,
             deviceOnLeft: deviceOnLeft,
             cameraLeads: cameraLeads,
@@ -1676,6 +1679,7 @@ final class CaptureEngine: NSObject, ObservableObject {
     func apply(preset: CapturePreset) {
         objectWillChange.send()
         customBackgroundRGB = preset.backgroundRGB
+        wallpaperID = preset.wallpaperID
         canvas = preset.canvas
         presenterLayout = preset.presenterLayout
         deviceOnLeft = preset.deviceOnLeft
@@ -1737,6 +1741,7 @@ final class CaptureEngine: NSObject, ObservableObject {
         CapturePreset(
             name: name,
             backgroundRGB: customBackgroundRGB ?? [1, 1, 1],
+            wallpaperID: wallpaperID,
             canvas: canvas,
             presenterLayout: presenterLayout,
             deviceOnLeft: deviceOnLeft,

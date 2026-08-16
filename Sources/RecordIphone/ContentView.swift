@@ -151,7 +151,7 @@ struct ContentView: View {
         GeometryReader { geo in
             let layout = engine.presenterLayout == .split ? engine.currentLayout() : nil
             ZStack {
-                canvasFill
+                liveCanvasFill
                 if engine.connectionKind == .wireless {
                     if engine.hasLiveDevice {
                         devicePreview(in: geo.size, layout: layout)
@@ -180,7 +180,7 @@ struct ContentView: View {
                     cameraBubble(in: geo.size, layout: layout)
                 }
                 if engine.freezeLivePreview || isFinishing {
-                    canvasFill.opacity(0.92)
+                    liveCanvasFill.opacity(0.92)
                         .overlay(
                             VStack(spacing: 10) {
                                 ProgressView().controlSize(.large)
@@ -194,17 +194,14 @@ struct ContentView: View {
             }
         }
         .modifier(CanvasShape(preset: engine.canvas, phoneAspect: engine.phoneAspect))
-        .background(canvasFill)
-        .clipShape(RoundedRectangle(cornerRadius: engine.canvas == .device ? 0 : 18, style: .continuous))
+        .modifier(SafeRoundedClip(radius: engine.canvas == .device ? 0 : 18))
         .shadow(color: .black.opacity(engine.canvas == .device ? 0 : 0.08), radius: 18, y: 6)
     }
 
-    private var canvasFill: Color {
-        if let rgb = engine.customBackgroundRGB, rgb.count >= 3 {
-            return Color(red: rgb[0], green: rgb[1], blue: rgb[2])
-        }
-        let c = engine.background.colors.top
-        return Color(red: c.0, green: c.1, blue: c.2)
+    private var liveCanvasFill: some View {
+        CanvasBackdrop(customRGB: engine.customBackgroundRGB,
+                       preset: engine.background,
+                       wallpaperID: engine.wallpaperID)
     }
 
     @ViewBuilder
@@ -1097,6 +1094,7 @@ struct ContentView: View {
     private func resetLook() {
         engine.background = .snow
         engine.customBackgroundRGB = [1, 1, 1]
+        engine.wallpaperID = nil
         engine.canvas = .device
         engine.presenterLayout = .floating
         engine.deviceOnLeft = true

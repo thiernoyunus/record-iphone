@@ -74,6 +74,7 @@ struct ExportLayout: Codable, Equatable {
     var screenCorners: Bool = true
     var showBorder: Bool = false
     var customBackgroundRGB: [CGFloat]? = nil
+    var wallpaperID: String? = nil
     var cameraEnabled: Bool = true
     var deviceOnLeft: Bool = true
     var cameraLeads: Bool = false
@@ -103,7 +104,7 @@ struct ExportLayout: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case bubbleCenter, bubbleFraction, canvas, background, showBezel, presenterLayout, phoneScale
         case cameraShape, ringRGB, frameStyle, screenCorners, showBorder
-        case customBackgroundRGB, cameraEnabled, deviceOnLeft, cameraLeads
+        case customBackgroundRGB, wallpaperID, cameraEnabled, deviceOnLeft, cameraLeads
         case overlapArrangement, splitBalance, splitGap, scenes
     }
 
@@ -117,6 +118,7 @@ struct ExportLayout: Codable, Equatable {
          screenCorners: Bool = true,
          showBorder: Bool = false,
          customBackgroundRGB: [CGFloat]? = nil,
+         wallpaperID: String? = nil,
          cameraEnabled: Bool = true,
          deviceOnLeft: Bool = true,
          cameraLeads: Bool = false,
@@ -137,6 +139,7 @@ struct ExportLayout: Codable, Equatable {
         self.screenCorners = screenCorners
         self.showBorder = showBorder
         self.customBackgroundRGB = customBackgroundRGB
+        self.wallpaperID = wallpaperID
         self.cameraEnabled = cameraEnabled
         self.deviceOnLeft = deviceOnLeft
         self.cameraLeads = cameraLeads
@@ -162,6 +165,7 @@ struct ExportLayout: Codable, Equatable {
         screenCorners = try c.decodeIfPresent(Bool.self, forKey: .screenCorners) ?? true
         showBorder = try c.decodeIfPresent(Bool.self, forKey: .showBorder) ?? false
         customBackgroundRGB = try c.decodeIfPresent([CGFloat].self, forKey: .customBackgroundRGB)
+        wallpaperID = try c.decodeIfPresent(String.self, forKey: .wallpaperID)
         cameraEnabled = try c.decodeIfPresent(Bool.self, forKey: .cameraEnabled) ?? true
         deviceOnLeft = try c.decodeIfPresent(Bool.self, forKey: .deviceOnLeft) ?? true
         cameraLeads = try c.decodeIfPresent(Bool.self, forKey: .cameraLeads) ?? false
@@ -186,6 +190,7 @@ struct ExportLayout: Codable, Equatable {
         try c.encode(screenCorners, forKey: .screenCorners)
         try c.encode(showBorder, forKey: .showBorder)
         try c.encodeIfPresent(customBackgroundRGB, forKey: .customBackgroundRGB)
+        try c.encodeIfPresent(wallpaperID, forKey: .wallpaperID)
         try c.encode(cameraEnabled, forKey: .cameraEnabled)
         try c.encode(deviceOnLeft, forKey: .deviceOnLeft)
         try c.encode(cameraLeads, forKey: .cameraLeads)
@@ -1394,6 +1399,9 @@ final class CanvasCompositor: NSObject, AVVideoCompositing {
     }
 
     private func background(size: CGSize, layout: ExportLayout) -> CIImage {
+        if let id = layout.wallpaperID, let picture = WallpaperCatalog.ciImage(id: id) {
+            return WallpaperCatalog.fitted(picture, to: size)
+        }
         let rgb = layout.customBackgroundRGB
         let top: (CGFloat, CGFloat, CGFloat)
         let bottom: (CGFloat, CGFloat, CGFloat)

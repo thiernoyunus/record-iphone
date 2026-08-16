@@ -55,12 +55,55 @@ enum SceneTiming {
 }
 
 enum TimelineLayout {
+    /// The slice of the take the timeline actually draws.
+    /// After a trim, that slice is the keep range so cut-away frames are off-screen.
+    struct KeepWindow: Equatable {
+        var viewStart: Double
+        var viewEnd: Double
+        var duration: Double
+        var trackWidth: CGFloat
+
+        var viewDur: Double { max(viewEnd - viewStart, 0.1) }
+        var pps: CGFloat { trackWidth / CGFloat(viewDur) }
+        var fullWidth: CGFloat { CGFloat(max(duration, 0.1)) * pps }
+        var shift: CGFloat { -CGFloat(viewStart) * pps }
+
+        func x(for time: Double) -> CGFloat {
+            CGFloat((time - viewStart) / viewDur) * trackWidth
+        }
+
+        func time(at x: CGFloat) -> Double {
+            let t = viewStart + Double(x / max(trackWidth, 1)) * viewDur
+            return min(max(t, 0), max(duration, 0))
+        }
+
+        func intersects(start: Double, duration span: Double) -> Bool {
+            start < viewEnd && (start + span) > viewStart
+        }
+    }
+
+    static func keepWindow(trimStart: Double, trimEnd: Double,
+                           duration: Double, trackWidth: CGFloat) -> KeepWindow {
+        let dur = max(duration, 0.1)
+        let end = min(max(trimEnd, 0.05), dur)
+        let start = min(max(trimStart, 0), max(0, end - 0.05))
+        return KeepWindow(
+            viewStart: start,
+            viewEnd: max(end, start + 0.05),
+            duration: dur,
+            trackWidth: max(trackWidth, 1))
+    }
+
     /// X of the playhead needle inside the timeline card.
     /// `time == 0` is the left edge of the tracks, not the middle.
     static func playheadX(time: Double, duration: Double, trackWidth: CGFloat, labelWidth: CGFloat) -> CGFloat {
         let dur = max(duration, 0.1)
         let t = min(max(time, 0), dur)
         return labelWidth + CGFloat(t / dur) * trackWidth
+    }
+
+    static func playheadX(time: Double, window: KeepWindow, labelWidth: CGFloat) -> CGFloat {
+        labelWidth + window.x(for: time)
     }
 
     /// Where a clip that lasts `span` seconds, starting at `start`, sits on a track.
@@ -365,10 +408,36 @@ enum EditorLogicTests {
         let xMid = TimelineLayout.playheadX(time: 14.5, duration: 29, trackWidth: 800, labelWidth: 56)
         expect("playhead in the middle is actually the middle", abs(xMid - 456) < 0.5)
 
+        let keep = TimelineLayout.keepWindow(trimStart: 2, trimEnd: 12, duration: 20, trackWidth: 1000)
+        expect("kept start sits on the left edge", abs(keep.x(for: 2)) < 0.01)
+        expect("kept end sits on the right edge", abs(keep.x(for: 12) - 1000) < 0.01)
+        expect("middle of the keep is the middle of the track", abs(keep.x(for: 7) - 500) < 0.5)
+        expect("cut-away head is off the left of the track", keep.x(for: 0) < -1)
+        expect("cut-away tail is off the right of the track", keep.x(for: 20) > 1001)
+        expect("clicking the left edge is the keep start, not file zero",
+               abs(keep.time(at: 0) - 2) < 0.001)
+        expect("a clip entirely before the trim does not overlap the keep",
+               !keep.intersects(start: 0, duration: 1.5))
+        expect("a clip that crosses the trim still overlaps the keep",
+               keep.intersects(start: 1, duration: 3))
+        let uncut = TimelineLayout.keepWindow(trimStart: 0, trimEnd: 20, duration: 20, trackWidth: 1000)
+        expect("with no trim the window is the whole take",
+               abs(uncut.x(for: 0)) < 0.01 && abs(uncut.x(for: 20) - 1000) < 0.01
+                && abs(uncut.shift) < 0.01 && abs(uncut.fullWidth - 1000) < 0.01)
+
         expect("style menu is named colors, not a pastel dump",
                SolidSwatch.styleMenu.allSatisfy { !$0.name.lowercased().contains("pastel") })
         expect("style menu has a useful set of colors",
                SolidSwatch.styleMenu.count >= 8 && SolidSwatch.styleMenu.count <= 16)
+        expect("wallpapers sit next to solid colors", WallpaperCatalog.all.count >= 12)
+        expect("Apple-named wallpapers are included",
+               WallpaperCatalog.all.contains(where: { $0.id == "sonoma-light" })
+               && WallpaperCatalog.all.contains(where: { $0.id == "sequoia-blue" })
+               && WallpaperCatalog.all.contains(where: { $0.id == "tahoe-light" })
+               && WallpaperCatalog.all.contains(where: { $0.id == "ventura" })
+               && WallpaperCatalog.all.contains(where: { $0.id == "ipad-17-light" }))
+        expect("wallpaper ids are unique",
+               Set(WallpaperCatalog.all.map(\.id)).count == WallpaperCatalog.all.count)
         expect("soft colors stay a short row",
                SolidSwatch.pastels.count <= 6)
         expect("soft colors are uniquely named",

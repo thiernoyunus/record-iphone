@@ -236,6 +236,7 @@ struct CapturePreset: Codable, Identifiable, Equatable {
     var id = UUID()
     var name: String
     var backgroundRGB: [CGFloat]
+    var wallpaperID: String? = nil
     var canvas: CanvasPreset
     var presenterLayout: PresenterLayout
     var deviceOnLeft: Bool

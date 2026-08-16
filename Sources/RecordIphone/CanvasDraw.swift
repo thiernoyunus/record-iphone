@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Shared canvas math so the editor preview and the export aim at the same spot.
@@ -39,13 +40,29 @@ enum CanvasDraw {
     }
 }
 
-/// Same top→bottom wash the exporter paints when no custom color is set.
+/// Skip clipShape when the radius is 0 so SwiftUI does not build a mask
+/// that can receive a NaN position.
+struct SafeRoundedClip: ViewModifier {
+    var radius: CGFloat
+    func body(content: Content) -> some View {
+        if radius.isFinite, radius > 0.5 {
+            content.clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        } else {
+            content
+        }
+    }
+}
+
+/// Same picture or color the exporter paints behind the phone.
 struct CanvasBackdrop: View {
     var customRGB: [CGFloat]?
     var preset: BackgroundPreset
+    var wallpaperID: String? = nil
 
     var body: some View {
-        if let rgb = customRGB, rgb.count >= 3 {
+        if let id = wallpaperID, let image = WallpaperCatalog.nsImage(id: id) {
+            WallpaperFill(image: image)
+        } else if let rgb = customRGB, rgb.count >= 3 {
             Color(red: rgb[0], green: rgb[1], blue: rgb[2])
         } else {
             let top = preset.colors.top
@@ -59,6 +76,64 @@ struct CanvasBackdrop: View {
                 endPoint: .bottom
             )
         }
+    }
+}
+
+/// Aspect-fill photo that never uses SwiftUI Image or clipShape.
+/// Those paths can hand Quartz a NaN layer position and abort the app.
+struct WallpaperFill: View {
+    let image: NSImage
+    var corner: CGFloat = 0
+
+    var body: some View {
+        Representable(image: image, corner: corner)
+    }
+
+    private struct Representable: NSViewRepresentable {
+        let image: NSImage
+        let corner: CGFloat
+
+        func makeNSView(context: Context) -> FillImageView {
+            let view = FillImageView()
+            view.image = image
+            view.corner = corner
+            return view
+        }
+
+        func updateNSView(_ nsView: FillImageView, context: Context) {
+            nsView.image = image
+            nsView.corner = corner
+        }
+
+        func sizeThatFits(_ proposal: ProposedViewSize, nsView: FillImageView, context: Context) -> CGSize? {
+            let width = proposal.width ?? 0
+            let height = proposal.height ?? 0
+            guard width.isFinite, height.isFinite else { return CGSize(width: 1, height: 1) }
+            return CGSize(width: max(1, width), height: max(1, height))
+        }
+    }
+}
+
+final class FillImageView: NSView {
+    var image: NSImage? {
+        didSet { layer?.contents = image }
+    }
+    var corner: CGFloat = 0 {
+        didSet { layer?.cornerRadius = corner }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.contentsGravity = .resizeAspectFill
+        layer?.masksToBounds = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
     }
 }
 

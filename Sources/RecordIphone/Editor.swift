@@ -66,6 +66,7 @@ final class EditorState: ObservableObject {
         /// CaptureEngine.openProject so reopened projects stay in sync.
         var cameraOffsetSeconds: Double?
         var customBackgroundRGB: [CGFloat]?
+        var wallpaperID: String?
         var cameraShape: CameraShape?
         var ringRGB: [CGFloat]?
         var frameStyle: DeviceFrameStyle?
@@ -438,6 +439,7 @@ final class EditorState: ObservableObject {
                                     ExportLayout.phoneScaleMax)
         }
         if let rgb = doc.customBackgroundRGB { engine.customBackgroundRGB = rgb }
+        engine.wallpaperID = doc.wallpaperID
         if let shape = doc.cameraShape { engine.cameraShape = shape }
         if let ring = doc.ringRGB { engine.ringRGB = ring }
         if let frame = doc.frameStyle { engine.frameStyle = frame; engine.showBezel = frame.showsBezel }
@@ -598,9 +600,9 @@ final class EditorState: ObservableObject {
         seekSources(to: clamped, slack: slack)
     }
 
-    /// Timeline scrub may target raw timeline positions (including outside
-    /// trim) when dragging the playhead; use this so dimmed regions remain
-    /// reachable for re-trimming.
+    /// Timeline scrub that can land anywhere on the file, including outside
+    /// the keep range. The playhead stays inside the trim; restore cut-away
+    /// frames by dragging a trim handle.
     func seekRaw(to seconds: Double) {
         seekRaw(to: seconds, precise: false)
     }
@@ -636,6 +638,7 @@ final class EditorState: ObservableObject {
             seek(to: trimStart)
         }
         save()
+        recordUndoPoint()
     }
 
     // MARK: - Zooms
@@ -742,6 +745,7 @@ final class EditorState: ObservableObject {
             phoneScale: engine.phoneScale,
             cameraOffsetSeconds: cameraOffset.seconds,
             customBackgroundRGB: engine.customBackgroundRGB,
+            wallpaperID: engine.wallpaperID,
             cameraShape: engine.cameraShape,
             ringRGB: engine.ringRGB,
             frameStyle: engine.frameStyle,
@@ -759,6 +763,11 @@ final class EditorState: ObservableObject {
         if let data = try? JSONEncoder().encode(doc) {
             try? data.write(to: projectURL, options: .atomic)
         }
+        recordUndoPoint()
+    }
+
+    /// Records an undo step even when project.json is not written yet.
+    func recordUndoPoint() {
         pushUndoSnapshotIfChanged()
     }
 
@@ -779,6 +788,7 @@ final class EditorState: ObservableObject {
         var cameraShape: CameraShape
         var ringRGB: [CGFloat]
         var customBackgroundRGB: [CGFloat]?
+        var wallpaperID: String?
         var frameStyle: DeviceFrameStyle
         var deviceOnLeft: Bool
         var cameraLeads: Bool
@@ -789,6 +799,7 @@ final class EditorState: ObservableObject {
         var cameraEnabled: Bool
         var phoneAudioLevel: CGFloat
         var micAudioLevel: CGFloat
+        var scenes: [SceneClip]
     }
 
     @Published private(set) var canUndo = false
@@ -806,6 +817,7 @@ final class EditorState: ObservableObject {
                      cameraShape: engine.cameraShape,
                      ringRGB: engine.ringRGB,
                      customBackgroundRGB: engine.customBackgroundRGB,
+                     wallpaperID: engine.wallpaperID,
                      frameStyle: engine.frameStyle,
                      deviceOnLeft: engine.deviceOnLeft,
                      cameraLeads: engine.cameraLeads,
@@ -815,7 +827,8 @@ final class EditorState: ObservableObject {
                      screenCorners: engine.screenCorners,
                      cameraEnabled: engine.cameraEnabled,
                      phoneAudioLevel: phoneMix,
-                     micAudioLevel: micMix)
+                     micAudioLevel: micMix,
+                     scenes: scenes)
     }
 
     /// Called from save() — every committed edit lands here exactly once.
@@ -852,6 +865,7 @@ final class EditorState: ObservableObject {
         engine.cameraShape = s.cameraShape
         engine.ringRGB = s.ringRGB
         engine.customBackgroundRGB = s.customBackgroundRGB
+        engine.wallpaperID = s.wallpaperID
         engine.frameStyle = s.frameStyle
         engine.deviceOnLeft = s.deviceOnLeft
         engine.cameraLeads = s.cameraLeads
@@ -862,12 +876,16 @@ final class EditorState: ObservableObject {
         engine.cameraEnabled = s.cameraEnabled
         phoneMix = s.phoneAudioLevel
         micMix = s.micAudioLevel
+        scenes = s.scenes
         applyPlaybackVolumes()
         if !zooms.contains(where: { $0.id == selectedZoomID }) { selectedZoomID = nil }
         applyTrimToPlayback()
         refreshPreview(immediate: true)
-        isRestoringSnapshot = false
         updateUndoFlags()
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(80))
+            self.isRestoringSnapshot = false
+        }
     }
 
     private func updateUndoFlags() {

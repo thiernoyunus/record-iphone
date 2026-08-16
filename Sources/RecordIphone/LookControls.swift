@@ -212,6 +212,8 @@ struct LookControls: View {
             colorGrid(SolidSwatch.solids)
             Text("Soft").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
             colorGrid(SolidSwatch.pastels)
+            Text("Wallpapers").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
+            wallpaperGrid()
             HStack {
                 Text("Hex").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
                 TextField("#FFFFFF", text: $hexDraft)
@@ -372,7 +374,7 @@ struct LookControls: View {
     private func colorGrid(_ swatches: [SolidSwatch]) -> some View {
         LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 8), spacing: 6) {
             ForEach(swatches) { swatch in
-                let on = matchesBackground(swatch.rgb)
+                let on = engine.wallpaperID == nil && matchesBackground(swatch.rgb)
                 Button { setBackground(swatch.rgb) } label: {
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
                         .fill(swatch.color)
@@ -382,6 +384,32 @@ struct LookControls: View {
                         .frame(height: 22)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(swatch.name)
+                .accessibilityAddTraits(on ? .isSelected : [])
+            }
+        }
+    }
+
+    private func wallpaperGrid() -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 5), spacing: 6) {
+            ForEach(WallpaperCatalog.all) { paper in
+                let on = engine.wallpaperID == paper.id
+                Button { setWallpaper(paper.id) } label: {
+                    Group {
+                        if let image = WallpaperCatalog.nsImage(id: paper.id) {
+                            WallpaperFill(image: image, corner: 6)
+                        } else {
+                            Color.black.opacity(0.06)
+                        }
+                    }
+                    .frame(height: 36)
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(on ? Frame.accent : Color.black.opacity(0.12),
+                                      lineWidth: on ? 2 : 1))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(paper.name)
+                .accessibilityAddTraits(on ? .isSelected : [])
             }
         }
     }
@@ -415,7 +443,13 @@ struct LookControls: View {
         }
     }
 
+    private func setWallpaper(_ id: String) {
+        engine.wallpaperID = id
+        onChange()
+    }
+
     private func setBackground(_ rgb: (CGFloat, CGFloat, CGFloat)) {
+        engine.wallpaperID = nil
         engine.customBackgroundRGB = [rgb.0, rgb.1, rgb.2]
         hexDraft = hexString(from: rgb)
         let isNearBlack = rgb.0 < 0.1 && rgb.1 < 0.1 && rgb.2 < 0.1

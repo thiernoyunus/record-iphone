@@ -47,13 +47,15 @@ struct RecordIphoneApp: App {
         }
         .commands {
             CommandGroup(replacing: .newItem) {}
-            CommandGroup(after: .undoRedo) {
+            CommandGroup(replacing: .undoRedo) {
                 Button("Undo") { engine.editor?.undo() }
-                    .keyboardShortcut("z")
+                    .keyboardShortcut("z", modifiers: [.command])
                     .disabled(!(engine.editor?.canUndo ?? false))
                 Button("Redo") { engine.editor?.redo() }
                     .keyboardShortcut("z", modifiers: [.command, .shift])
                     .disabled(!(engine.editor?.canRedo ?? false))
+            }
+            CommandGroup(after: .undoRedo) {
                 Button("Remove Zoom") { engine.editor?.deleteSelectedZoom() }
                     .keyboardShortcut(.delete)
                     .disabled(engine.editor?.selectedZoomID == nil)

@@ -14,6 +14,7 @@ struct EditorView: View {
     @State private var cameraSelected = false
     @State private var timelineHeightBase: CGFloat?
     @State private var timelineScrollMonitor: Any?
+    @State private var undoKeyMonitor: Any?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -71,12 +72,32 @@ struct EditorView: View {
                 editor.bumpTimelineZoom(event.scrollingDeltaY > 0 ? 1.12 : 1 / 1.12)
                 return nil
             }
+            undoKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                guard event.modifierFlags.contains(.command),
+                      !event.modifierFlags.contains(.option) else { return event }
+                if let responder = NSApp.keyWindow?.firstResponder,
+                   responder is NSTextView || responder is NSText { return event }
+                let key = event.charactersIgnoringModifiers?.lowercased()
+                if key == "z" {
+                    if event.modifierFlags.contains(.shift) {
+                        if editor.canRedo { editor.redo(); return nil }
+                    } else if editor.canUndo {
+                        editor.undo()
+                        return nil
+                    }
+                }
+                return event
+            }
         }
         .onDisappear {
             if let timelineScrollMonitor {
                 NSEvent.removeMonitor(timelineScrollMonitor)
             }
             timelineScrollMonitor = nil
+            if let undoKeyMonitor {
+                NSEvent.removeMonitor(undoKeyMonitor)
+            }
+            undoKeyMonitor = nil
         }
         .confirmationDialog("Move this recording to the Trash?", isPresented: $confirmTrash) {
             Button("Move to Trash", role: .destructive) {
@@ -104,6 +125,27 @@ struct EditorView: View {
             .buttonStyle(.plain)
             .help("Back to your clips")
 
+            Button { editor.undo() } label: {
+                Image(systemName: "arrow.uturn.backward")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(editor.canUndo ? Frame.label : Frame.tertiary)
+                    .frame(width: 30, height: 30)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!editor.canUndo)
+            .help("Undo (⌘Z)")
+            Button { editor.redo() } label: {
+                Image(systemName: "arrow.uturn.forward")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(editor.canRedo ? Frame.label : Frame.tertiary)
+                    .frame(width: 30, height: 30)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!editor.canRedo)
+            .help("Redo (⇧⌘Z)")
+
             Spacer()
 
             if editor.cameraClipStatus == .wantedButMissing {
@@ -128,14 +170,68 @@ struct EditorView: View {
             .buttonStyle(.plain)
             .help("Same look controls as before you recorded")
 
-            Button { confirmTrash = true } label: {
-                Label("Delete", systemImage: "trash")
+            chromeMenu(title: "Canvas", value: {
+                let size = engine.canvas.size(phoneAspect: engine.phoneAspect)
+                return "\(Int(size.width)) × \(Int(size.height))"
+            }()) {
+                ForEach(CanvasPreset.allCases) { preset in
+                    Button(preset.displayTitle) {
+                        engine.canvas = preset
+                        editor.refreshPreview(immediate: true)
+                    }
+                }
+            }
+            chromeMenu(title: "Fit", value: engine.phoneScale > 0.86 ? "Fill" : "Fit") {
+                Button("Fit") {
+                    engine.phoneScale = 0.78
+                    editor.refreshPreview(immediate: true)
+                }
+                Button("Fill") {
+                    engine.phoneScale = ExportLayout.phoneScaleMax
+                    editor.refreshPreview(immediate: true)
+                }
+            }
+            chromeMenu(title: "Style", value: styleName) {
+                ForEach(SolidSwatch.styleMenu) { swatch in
+                    Button(swatch.name) {
+                        engine.wallpaperID = nil
+                        engine.customBackgroundRGB = [swatch.rgb.0, swatch.rgb.1, swatch.rgb.2]
+                        editor.refreshPreview(immediate: true)
+                    }
+                }
+                Divider()
+                ForEach(WallpaperCatalog.all.prefix(8)) { paper in
+                    Button(paper.name) {
+                        engine.wallpaperID = paper.id
+                        editor.refreshPreview(immediate: true)
+                    }
+                }
+            } trailing: {
+                styleSwatch
+                    .frame(width: 10, height: 10)
+                    .overlay(Circle().strokeBorder(Color.black.opacity(0.15)))
+            }
+
+            Button { pickAndExport() } label: {
+                Label("Save", systemImage: "checkmark")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Frame.delete)
-                    .padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(Frame.delete.opacity(0.08), in: Capsule())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(Frame.save, in: Capsule())
             }
             .buttonStyle(.plain)
+            .disabled(!editor.isReady)
+            .help("Save the finished movie")
+
+            Button { confirmTrash = true } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Frame.delete)
+                    .frame(width: 30, height: 30)
+                    .background(Frame.delete.opacity(0.08), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .help("Move this recording to the Trash")
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 8)
@@ -194,9 +290,10 @@ struct EditorView: View {
     private var sceneTimeline: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                jumpToStartButton
+                jumpToStartButton(lightOnDark: false)
                 playButton
                 transportClock
+                    .foregroundStyle(Frame.label)
                 Spacer()
             }
             GeometryReader { geo in
@@ -400,16 +497,17 @@ struct EditorView: View {
                     .padding(24)
                 }
             }
-            .frame(width: fitW, height: fitH)
+            .frame(width: max(1, fitW), height: max(1, fitH))
             .background(stageFill)
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .modifier(SafeRoundedClip(radius: 22))
             .shadow(color: .black.opacity(0.18), radius: 28, y: 12)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
     private var stageFill: some View {
-        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background)
+        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background,
+                       wallpaperID: engine.wallpaperID)
     }
 
     // MARK: - Transport + timeline
@@ -427,33 +525,45 @@ struct EditorView: View {
         .keyboardShortcut(.space, modifiers: [])
     }
 
-    private var jumpToStartButton: some View {
+    private func jumpToStartButton(lightOnDark: Bool = true) -> some View {
         Button { editor.seek(to: editor.trimStart) } label: {
             Image(systemName: "backward.end.fill")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Frame.label)
-                .frame(width: 36, height: 36)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(lightOnDark ? Color.white.opacity(0.9) : Frame.label)
+                .frame(width: 34, height: 34)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help("Jump to start")
     }
 
+    private func jumpToEndButton(lightOnDark: Bool = true) -> some View {
+        Button { editor.seek(to: max(editor.trimStart, editor.trimEnd - 0.05)) } label: {
+            Image(systemName: "forward.end.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(lightOnDark ? Color.white.opacity(0.9) : Frame.label)
+                .frame(width: 34, height: 34)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Jump to end")
+    }
+
     private var transportClock: some View {
         Text(String(format: "%@ / %@",
                     clock(max(0, editor.currentTime - editor.trimStart)),
                     clock(max(0, editor.trimEnd - editor.trimStart))))
-            .font(.system(size: 13, weight: .semibold, design: .monospaced))
-            .foregroundStyle(Frame.label)
-            .frame(minWidth: 96, alignment: .leading)
+            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+            .foregroundStyle(Color.white.opacity(0.9))
+            .frame(minWidth: 92, alignment: .center)
     }
 
     private func deckIcon(_ system: String, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: system)
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Frame.label)
-                .frame(width: 32, height: 32)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.88))
+                .frame(width: 30, height: 30)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -461,7 +571,7 @@ struct EditorView: View {
     }
 
     private var timelineTools: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 2) {
             deckIcon(editor.timelineHidden
                      ? "rectangle.bottomhalf.inset.filled"
                      : "rectangle.bottomhalf.filled",
@@ -475,38 +585,42 @@ struct EditorView: View {
                 editor.bumpTimelineZoom(1.15)
             }
             Button { editor.addZoom() } label: {
-                Label("Add Zoom", systemImage: "plus.magnifyingglass")
-                    .font(.system(size: 13, weight: .semibold))
+                Text("Zoom")
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
                     .background(Frame.accent, in: Capsule())
             }
             .buttonStyle(.plain)
             .disabled(!editor.isReady)
+            .help("Add a zoom at the playhead")
             Button { editor.mode = .scenes } label: {
                 Text("Scenes")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Frame.label)
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                    .background(Color.black.opacity(0.05), in: Capsule())
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.9))
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(Color.white.opacity(0.1), in: Capsule())
             }
             .buttonStyle(.plain)
         }
     }
 
     private var timelineDeck: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             timelineResizeHandle
-            ZStack {
-                HStack(alignment: .center, spacing: 8) {
-                    jumpToStartButton
-                    transportClock
-                    Spacer(minLength: 8)
-                    timelineTools
+            HStack(spacing: 10) {
+                transportClock.frame(width: 100, alignment: .leading)
+                Spacer(minLength: 0)
+                HStack(spacing: 6) {
+                    jumpToStartButton()
+                    playButton
+                    jumpToEndButton()
                 }
-                playButton
+                Spacer(minLength: 0)
+                timelineTools
             }
             .frame(height: 48)
+            .padding(.horizontal, 8)
             if !editor.timelineHidden {
                 GeometryReader { geo in
                     let contentW = max(geo.size.width, geo.size.width * editor.timelineZoom)
@@ -517,19 +631,18 @@ struct EditorView: View {
                 }
                 .frame(height: editor.timelineHeight)
             }
-            editorChromeBar
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(Color.white)
-        .overlay(Rectangle().fill(Frame.hairline).frame(height: 1), alignment: .top)
+        .padding(.horizontal, 12)
+        .padding(.top, 4)
+        .padding(.bottom, 10)
+        .background(Frame.timeline)
     }
 
     private var timelineResizeHandle: some View {
         HStack {
             Spacer()
             Capsule()
-                .fill(Color.black.opacity(0.18))
+                .fill(Color.white.opacity(0.28))
                 .frame(width: 36, height: 4)
             Spacer()
         }
@@ -548,61 +661,10 @@ struct EditorView: View {
         .help("Drag to make the timeline taller or shorter")
     }
 
-    private var editorChromeBar: some View {
-        let canvasSize = engine.canvas.size(phoneAspect: engine.phoneAspect)
-        return HStack(spacing: 10) {
-            chromeMenu(title: "Canvas", value: "\(Int(canvasSize.width)) × \(Int(canvasSize.height))") {
-                ForEach(CanvasPreset.allCases) { preset in
-                    Button(preset.displayTitle) {
-                        engine.canvas = preset
-                        editor.refreshPreview(immediate: true)
-                    }
-                }
-            }
-            chromeMenu(title: "Fit", value: engine.phoneScale > 0.86 ? "Fill" : "Fit") {
-                Button("Fit") {
-                    engine.phoneScale = 0.78
-                    editor.refreshPreview(immediate: true)
-                }
-                Button("Fill") {
-                    engine.phoneScale = ExportLayout.phoneScaleMax
-                    editor.refreshPreview(immediate: true)
-                }
-            }
-            chromeMenu(title: "Style", value: styleName) {
-                ForEach(SolidSwatch.styleMenu) { swatch in
-                    Button(swatch.name) {
-                        engine.customBackgroundRGB = [swatch.rgb.0, swatch.rgb.1, swatch.rgb.2]
-                        editor.refreshPreview(immediate: true)
-                    }
-                }
-            } trailing: {
-                Circle()
-                    .fill(Color(red: engine.customBackgroundRGB?[safe: 0] ?? 1,
-                                green: engine.customBackgroundRGB?[safe: 1] ?? 1,
-                                blue: engine.customBackgroundRGB?[safe: 2] ?? 1))
-                    .frame(width: 10, height: 10)
-                    .overlay(Circle().strokeBorder(Color.black.opacity(0.15)))
-            }
-            Spacer()
-            Button { pickAndExport() } label: {
-                Label("Save", systemImage: "checkmark")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 14).padding(.vertical, 7)
-                    .background(Frame.save, in: Capsule())
-            }
-            .buttonStyle(.plain)
-            .disabled(!editor.isReady)
-            .help("Save the finished movie")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Frame.surface, in: Capsule())
-        .overlay(Capsule().strokeBorder(Frame.pillStroke, lineWidth: 1))
-    }
-
     private var styleName: String {
+        if let paper = WallpaperCatalog.paper(id: engine.wallpaperID) {
+            return paper.name
+        }
         let rgb = (
             engine.customBackgroundRGB?[safe: 0] ?? 1,
             engine.customBackgroundRGB?[safe: 1] ?? 1,
@@ -615,6 +677,17 @@ struct EditorView: View {
             return named.name
         }
         return "Custom"
+    }
+
+    @ViewBuilder
+    private var styleSwatch: some View {
+        if let id = engine.wallpaperID, let image = WallpaperCatalog.nsImage(id: id) {
+            WallpaperFill(image: image, corner: 5)
+        } else {
+            Color(red: engine.customBackgroundRGB?[safe: 0] ?? 1,
+                  green: engine.customBackgroundRGB?[safe: 1] ?? 1,
+                  blue: engine.customBackgroundRGB?[safe: 2] ?? 1)
+        }
     }
 
     private func chromeMenu<C: View, T: View>(
@@ -748,7 +821,8 @@ private struct DualReviewCanvas: View {
     }
 
     private var canvasFill: some View {
-        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background)
+        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background,
+                       wallpaperID: engine.wallpaperID)
     }
 
     private func phoneLayer(screen: CGRect, zoomScale: CGFloat,
