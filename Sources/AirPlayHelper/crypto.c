@@ -33,9 +33,11 @@
 #include <openssl/pem.h>
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h>
 
 #include "utils.h"
 
@@ -423,13 +425,18 @@ ed25519_key_t *ed25519_key_generate(const char *device_id, const char *keyfile, 
         }
         EVP_PKEY_CTX_free(pctx);
         if (use_keyfile) {
-            file = fopen(keyfile, "w");
+            /* Create the private key 0600 — fopen("w") would leave it
+               world-readable under the default umask. */
+            int kfd = open(keyfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (kfd >= 0) file = fdopen(kfd, "w");
             if (file) {
                 bp = BIO_new_fp(file, BIO_NOCLOSE);
                 PEM_write_bio_PrivateKey(bp, key->pkey, NULL, NULL, 0, NULL, NULL);
                 BIO_free(bp);
                 fclose(file);
                 *result = 1;
+            } else if (kfd >= 0) {
+                close(kfd);
             }
         }
     }

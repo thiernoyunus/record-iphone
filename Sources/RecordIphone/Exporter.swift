@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import Darwin
 
 /// AVFoundation confines these three objects to one serial queue, but its
 /// legacy Objective-C types do not declare that fact to Swift's checker.
@@ -96,6 +97,19 @@ struct ExportLayout: Codable, Equatable {
     /// Allowed camera size range (fraction of min canvas side).
     static let bubbleMin: CGFloat = 0.14
     static let bubbleMax: CGFloat = 0.72
+    /// Largest canvas the exporter will render. Exports run in a separate
+    /// process, so a crafted spec cannot take the app down — but keep the
+    /// pixel-buffer allocation bounded anyway.
+    static let canvasMinSide: CGFloat = 320
+    static let canvasMaxSide: CGFloat = 7680
+
+    /// Clamp a decoded canvas size to a finite, renderable range.
+    static func sanitizedCanvas(_ size: CGSize) -> CGSize {
+        let clamp = { (v: CGFloat, fallback: CGFloat) in
+            min(max(v.isFinite ? v : fallback, canvasMinSide), canvasMaxSide)
+        }
+        return CGSize(width: clamp(size.width, 1920), height: clamp(size.height, 1080))
+    }
     static let bezelColor: (CGFloat, CGFloat, CGFloat) = (0.10, 0.10, 0.11)
     static let bezelHighlight: (CGFloat, CGFloat, CGFloat) = (0.32, 0.32, 0.34)
 
@@ -148,27 +162,43 @@ struct ExportLayout: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        bubbleCenter = try c.decode(CGPoint.self, forKey: .bubbleCenter)
-        bubbleFraction = try c.decode(CGFloat.self, forKey: .bubbleFraction)
-        canvas = try c.decode(CGSize.self, forKey: .canvas)
+        // Spec files are JSON on disk — clamp every numeric field to the
+        // ranges the UI enforces so a crafted file cannot make the export
+        // worker spin or allocate enormous pixel buffers.
+        let rawCenter = try c.decode(CGPoint.self, forKey: .bubbleCenter)
+        bubbleCenter = CGPoint(x: min(max(rawCenter.x, 0.05), 0.95),
+                               y: min(max(rawCenter.y, 0.05), 0.95))
+        bubbleFraction = min(max(try c.decode(CGFloat.self, forKey: .bubbleFraction),
+                                 ExportLayout.bubbleMin), ExportLayout.bubbleMax)
+        canvas = ExportLayout.sanitizedCanvas(try c.decode(CGSize.self, forKey: .canvas))
         background = try c.decode(BackgroundPreset.self, forKey: .background)
         showBezel = try c.decode(Bool.self, forKey: .showBezel)
         presenterLayout = try c.decodeIfPresent(PresenterLayout.self, forKey: .presenterLayout) ?? .floating
-        phoneScale = try c.decodeIfPresent(CGFloat.self, forKey: .phoneScale) ?? ExportLayout.phoneHeightFraction
+        phoneScale = min(max(try c.decodeIfPresent(CGFloat.self, forKey: .phoneScale)
+                             ?? ExportLayout.phoneHeightFraction,
+                             ExportLayout.phoneScaleMin), ExportLayout.phoneScaleMax)
         cameraShape = try c.decodeIfPresent(CameraShape.self, forKey: .cameraShape) ?? .circle
-        ringRGB = try c.decodeIfPresent([CGFloat].self, forKey: .ringRGB) ?? [1, 1, 1]
+        ringRGB = (try c.decodeIfPresent([CGFloat].self, forKey: .ringRGB) ?? [1, 1, 1])
+            .map { min(max($0, 0), 1) }
         frameStyle = try c.decodeIfPresent(DeviceFrameStyle.self, forKey: .frameStyle)
             ?? (showBezel ? .black : .none)
         screenCorners = try c.decodeIfPresent(Bool.self, forKey: .screenCorners) ?? true
         showBorder = try c.decodeIfPresent(Bool.self, forKey: .showBorder) ?? false
-        customBackgroundRGB = try c.decodeIfPresent([CGFloat].self, forKey: .customBackgroundRGB)
+        customBackgroundRGB = try c.decodeIfPresent([CGFloat].self, forKey: .customBackgroundRGB)?
+            .map { min(max($0, 0), 1) }
         cameraEnabled = try c.decodeIfPresent(Bool.self, forKey: .cameraEnabled) ?? true
         deviceOnLeft = try c.decodeIfPresent(Bool.self, forKey: .deviceOnLeft) ?? true
         cameraLeads = try c.decodeIfPresent(Bool.self, forKey: .cameraLeads) ?? false
         overlapArrangement = try c.decodeIfPresent(Bool.self, forKey: .overlapArrangement) ?? false
-        splitBalance = try c.decodeIfPresent(CGFloat.self, forKey: .splitBalance) ?? 0.55
-        splitGap = try c.decodeIfPresent(CGFloat.self, forKey: .splitGap) ?? 0.08
-        scenes = try c.decodeIfPresent([SceneClip].self, forKey: .scenes) ?? []
+        splitBalance = min(max(try c.decodeIfPresent(CGFloat.self, forKey: .splitBalance) ?? 0.55, 0), 1)
+        splitGap = min(max(try c.decodeIfPresent(CGFloat.self, forKey: .splitGap) ?? 0.08, 0), 0.5)
+        let rawScenes = try c.decodeIfPresent([SceneClip].self, forKey: .scenes) ?? []
+        scenes = rawScenes.prefix(64).map { clip in
+            var clip = clip
+            clip.start = max(0, clip.start)
+            clip.duration = min(max(clip.duration, 0.4), 3600)
+            return clip
+        }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -795,8 +825,21 @@ enum Exporter {
     }
 
     private static var ffmpegPath: String? {
+        // Only run ffmpeg we can vouch for: owned by root or the current
+        // user, and not writable by group/others. Otherwise another local
+        // user who can write a Homebrew prefix could swap in a malicious
+        // binary that the app runs with the user's full rights.
         ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-            .first { FileManager.default.isExecutableFile(atPath: $0) }
+            .first { isTrustedExecutable($0) }
+    }
+
+    private static func isTrustedExecutable(_ path: String) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: path) else { return false }
+        var st = stat()
+        guard stat(path, &st) == 0 else { return false }
+        let ownerOK = st.st_uid == 0 || st.st_uid == getuid()
+        let writableByOthers = (st.st_mode & 0o022) != 0
+        return ownerOK && !writableByOthers
     }
 
     private static func muxVideo(_ video: URL, audio: URL, into dest: URL) async -> URL? {

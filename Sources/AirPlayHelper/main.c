@@ -390,6 +390,7 @@ static void register_client_cb(void *cls, const char *device_id, const char *pk_
     if (check_register_cb(NULL, pk_str)) return;
     int fd = open(g_clients_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0) return;
+    (void)fchmod(fd, 0600); /* fix perms on files created before this hardening */
     FILE *fp = fdopen(fd, "a");
     if (!fp) {
         close(fd);
@@ -549,7 +550,7 @@ static void random_mac(char *out, size_t out_len) {
 }
 
 static void ensure_dir(const char *path) {
-    mkdir(path, 0755);
+    mkdir(path, 0700);
 }
 
 int main(int argc, char **argv) {
@@ -584,7 +585,11 @@ int main(int argc, char **argv) {
     char logfile[1100];
     snprintf(logfile, sizeof(logfile), "%s/airplay-helper.log", key_dir);
     snprintf(g_clients_path, sizeof(g_clients_path), "%s/airplay-clients.txt", key_dir);
-    g_log = fopen(logfile, "a");
+    int logfd = open(logfile, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (logfd >= 0) {
+        g_log = fdopen(logfd, "a");
+        if (!g_log) close(logfd);
+    }
     file_log("---- helper start name=%s sock=%s ----", name, g_sock_path);
 
     pthread_t video_thr;

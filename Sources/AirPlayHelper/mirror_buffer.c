@@ -92,11 +92,24 @@ mirror_buffer_init(logger_t *logger, const unsigned char *aeskey)
 }
 
 void mirror_buffer_decrypt(mirror_buffer_t *mirror_buffer, unsigned char* input, unsigned char* output, int inputLen) {
-    // Start decrypting
-    if (mirror_buffer->nextDecryptCount > 0) {//mirror_buffer->nextDecryptCount = 10
-        for (int i = 0; i < mirror_buffer->nextDecryptCount; i++) {
+    /* If a packet is shorter than the carried-over partial block, only the
+       first inputLen bytes can be recovered from the remainder. Consuming
+       them keeps the AES-CTR stream aligned; the old code wrote
+       nextDecryptCount bytes past the output buffer instead. */
+    if (mirror_buffer->nextDecryptCount > 0) {
+        int pending = mirror_buffer->nextDecryptCount;
+        if (pending > inputLen) pending = inputLen;
+        for (int i = 0; i < pending; i++) {
             output[i] = (input[i] ^ mirror_buffer->og[(16 - mirror_buffer->nextDecryptCount) + i]);
         }
+        if (inputLen <= mirror_buffer->nextDecryptCount) {
+            mirror_buffer->nextDecryptCount -= inputLen;
+            return;
+        }
+        input += pending;
+        output += pending;
+        inputLen -= pending;
+        mirror_buffer->nextDecryptCount = 0;
     }
     // Handling encrypted bytes
     int encryptlen = ((inputLen - mirror_buffer->nextDecryptCount) / 16) * 16;

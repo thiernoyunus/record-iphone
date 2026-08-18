@@ -509,8 +509,18 @@ raop_rtp_mirror_thread(void *arg)
                 int nalu_size = 0;
                 int nalus_count = 0;
                 while (nalu_size < payload_size) {
-                    int nc_len = byteutils_get_int_be(payload_decrypted, nalu_size);
-                    if (nc_len < 0 || nalu_size + 4 > payload_size) {
+                    /* Bound the 4-byte length prefix, the NAL header byte,
+                       and the NAL body against the remaining payload before
+                       any dereference. Without this, crafted lengths wrap the
+                       offset and read/write outside the heap buffer. */
+                    int nc_len = 0;
+                    if (nalu_size + 5 > payload_size) {
+                        valid_data = false;
+                        break;
+                    }
+                    nc_len = byteutils_get_int_be(payload_decrypted, nalu_size);
+                    if (nc_len < 0 ||
+                        (uint32_t)nc_len > (uint32_t)(payload_size - nalu_size - 4)) {
                         valid_data = false;
                         break;
                     }

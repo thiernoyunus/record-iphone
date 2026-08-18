@@ -422,14 +422,15 @@ final class EditorState: ObservableObject {
     private func apply(_ doc: ProjectDoc) {
         trimStart = min(max(0, doc.trimStart), duration - 0.5)
         trimEnd = min(max(trimStart + 0.5, doc.trimEnd), duration)
-        zooms = doc.zooms
+        zooms = Self.sanitizedZooms(doc.zooms, duration: duration)
         if let bg = doc.background { engine.background = bg }
         if let bezel = doc.showBezel { engine.showBezel = bezel }
         if let frac = doc.bubbleFraction {
             engine.bubbleFraction = min(max(frac, ExportLayout.bubbleMin), ExportLayout.bubbleMax)
         }
         if let x = doc.bubbleCenterX, let y = doc.bubbleCenterY {
-            engine.bubbleCenter = CGPoint(x: x, y: y)
+            engine.bubbleCenter = CGPoint(x: min(max(x, 0.05), 0.95),
+                                          y: min(max(y, 0.05), 0.95))
         }
         if let canvas = doc.canvas { engine.canvas = canvas }
         if let pl = doc.presenterLayout { engine.presenterLayout = pl }
@@ -449,16 +450,44 @@ final class EditorState: ObservableObject {
         if let left = doc.deviceOnLeft { engine.deviceOnLeft = left }
         if let leads = doc.cameraLeads { engine.cameraLeads = leads }
         if let overlap = doc.overlapArrangement { engine.overlapArrangement = overlap }
-        if let bal = doc.splitBalance { engine.splitBalance = bal }
-        if let gap = doc.splitGap { engine.splitGap = gap }
+        if let bal = doc.splitBalance { engine.splitBalance = min(max(bal, 0), 1) }
+        if let gap = doc.splitGap { engine.splitGap = min(max(gap, 0), 0.5) }
         if let corners = doc.screenCorners { engine.screenCorners = corners }
         if let p = doc.phoneAudioLevel {
             phoneMix = min(max(p, 0), 1)
             phoneMixFromProject = true
         }
         if let m = doc.micAudioLevel { micMix = min(max(m, 0), 1) }
-        scenes = doc.scenes ?? []
+        scenes = Self.sanitizedScenes(doc.scenes ?? [], duration: duration)
         applyPlaybackVolumes()
+    }
+
+    /// Clamp loaded zoom values to the ranges the UI enforces so a crafted
+    /// project.json cannot make the export worker spin on transforms.
+    private static func sanitizedZooms(_ zooms: [ZoomSegment], duration: Double) -> [ZoomSegment] {
+        guard duration.isFinite, duration > 0 else { return [] }
+        let hi = max(0, duration - 0.5)
+        return zooms.prefix(64).compactMap { z in
+            var z = z
+            z.start = min(max(z.start, 0), hi)
+            z.duration = min(max(z.duration, 0.5), max(0.5, duration - z.start))
+            z.center = CGPoint(x: min(max(z.center.x, 0.05), 0.95),
+                               y: min(max(z.center.y, 0.05), 0.95))
+            z.level = min(max(z.level, 1.2), 3.5)
+            return z.duration >= 0.5 ? z : nil
+        }.sorted { $0.start < $1.start }
+    }
+
+    /// Clamp loaded scene values to the same range the UI uses.
+    private static func sanitizedScenes(_ scenes: [SceneClip], duration: Double) -> [SceneClip] {
+        guard duration.isFinite, duration > 0 else { return [] }
+        let hi = max(0, duration - 0.4)
+        return scenes.prefix(64).map { c in
+            var c = c
+            c.start = min(max(c.start, 0), hi)
+            c.duration = min(max(c.duration, 0.4), max(0.4, duration - c.start))
+            return c
+        }
     }
 
     private func installPhoneOnlyItem() {
