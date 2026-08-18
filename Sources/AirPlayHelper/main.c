@@ -551,6 +551,7 @@ static void random_mac(char *out, size_t out_len) {
 
 static void ensure_dir(const char *path) {
     mkdir(path, 0700);
+    (void)chmod(path, 0700); /* repair directories created before hardening */
 }
 
 int main(int argc, char **argv) {
@@ -587,6 +588,7 @@ int main(int argc, char **argv) {
     snprintf(g_clients_path, sizeof(g_clients_path), "%s/airplay-clients.txt", key_dir);
     int logfd = open(logfile, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (logfd >= 0) {
+        (void)fchmod(logfd, 0600); /* repair legacy log permissions */
         g_log = fdopen(logfd, "a");
         if (!g_log) close(logfd);
     }

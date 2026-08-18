@@ -164,8 +164,8 @@ final class AirPlayMirror: ObservableObject {
         stderrHandle?.readabilityHandler = nil
         // All I/O state lives on ioQueue (socket source + event hops below);
         // tear it down there so no handler is mid-append while we reset it.
-        ioGeneration += 1
         ioQueue.sync {
+            ioGeneration += 1
             videoHandle?.readabilityHandler = nil
             videoSource?.cancel()
             videoSource = nil
@@ -510,6 +510,10 @@ final class AirPlayMirror: ObservableObject {
     }
 
     private func readEvents(_ handle: FileHandle) {
+        // Stale events from a previous run must not reach a later session:
+        // capture the run epoch when the handler is installed and drop any
+        // chunk whose epoch no longer matches (checked on ioQueue).
+        let installedGen = ioGeneration
         handle.readabilityHandler = { [weak self] h in
             let data = h.availableData
             if data.isEmpty {
@@ -517,9 +521,8 @@ final class AirPlayMirror: ObservableObject {
                 return
             }
             guard let self else { return }
-            let gen = self.ioGeneration
             self.ioQueue.async {
-                guard gen == self.ioGeneration else { return }
+                guard installedGen == self.ioGeneration else { return }
                 self.consumeEvents(data)
             }
         }

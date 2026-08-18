@@ -994,9 +994,7 @@ enum Exporter {
 
     /// Stream-copy remux via ffmpeg when available (Homebrew).
     private static func remuxMovie(_ url: URL) async -> URL? {
-        let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-            .first { FileManager.default.isExecutableFile(atPath: $0) }
-        guard let ffmpeg else {
+        guard let ffmpeg = ffmpegPath else {
             NSLog("[media] ffmpeg not found — cannot repair broken movie header")
             return nil
         }
