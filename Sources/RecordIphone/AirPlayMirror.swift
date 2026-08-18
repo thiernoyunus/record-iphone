@@ -444,7 +444,13 @@ final class AirPlayMirror: ObservableObject {
             close(fd)
             return nil
         }
-        _ = fchmod(fd, 0o700) // only this user may connect
+        // fchmod on a socket descriptor does not reliably set the socket
+        // file's permissions — chmod the path after bind instead.
+        guard chmod(path, 0o700) == 0 else {
+            close(fd)
+            unlink(path)
+            return nil
+        }
         let flags = fcntl(fd, F_GETFL, 0)
         if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
         listenFD = fd
