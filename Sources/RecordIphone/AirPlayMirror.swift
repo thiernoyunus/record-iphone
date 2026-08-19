@@ -56,6 +56,16 @@ final class AirPlayMirror: ObservableObject {
         return sourceSize.width / sourceSize.height
     }
 
+    /// Frame sizes come from network packet floats; clamp to a sane canvas
+    /// range so a hostile size cannot trap Int() conversion or exhaust
+    /// memory when a wireless recording starts.
+    static func sanitizedSourceSize(_ size: CGSize) -> CGSize {
+        let clamp = { (v: CGFloat, fallback: CGFloat) in
+            min(max(v.isFinite ? v : fallback, 64), 8192)
+        }
+        return CGSize(width: clamp(size.width, 1170), height: clamp(size.height, 2532))
+    }
+
     nonisolated(unsafe) private var process: Process?
     private var stdoutHandle: FileHandle?
     private var stderrHandle: FileHandle?
@@ -74,6 +84,12 @@ final class AirPlayMirror: ObservableObject {
     nonisolated(unsafe) var captureNextStill = false
     nonisolated(unsafe) private var leftover = Data()
     nonisolated(unsafe) private var videoLeftover = Data()
+    /// Bumped on every stop() so stale event-handler work cannot append to
+    /// buffers that teardown has already cleared.
+    nonisolated(unsafe) private var ioGeneration = 0
+    /// Largest single framed payload the helper can legitimately produce.
+    /// (Video frames cap at ~2 MiB in the helper; events at 2048 bytes.)
+    nonisolated private static let maxFramePayload = UInt32(16 * 1024 * 1024)
     nonisolated(unsafe) private var decoder = H264Decoder()
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
@@ -146,19 +162,27 @@ final class AirPlayMirror: ObservableObject {
         process = nil
         stdoutHandle?.readabilityHandler = nil
         stderrHandle?.readabilityHandler = nil
-        videoHandle?.readabilityHandler = nil
-        videoSource?.cancel()
-        videoSource = nil
-        listenSource?.cancel()
-        listenSource = nil
-        videoFD = -1
-        stdoutHandle = nil
-        stderrHandle = nil
-        videoHandle = nil
-        if listenFD >= 0 { close(listenFD); listenFD = -1 }
-        if !sockPath.isEmpty { unlink(sockPath) }
-        leftover = Data()
-        videoLeftover = Data()
+        // All I/O state lives on ioQueue (socket source + event hops below);
+        // tear it down there so no handler is mid-append while we reset it.
+        ioQueue.sync {
+            ioGeneration += 1
+            videoHandle?.readabilityHandler = nil
+            videoSource?.cancel()
+            videoSource = nil
+            listenSource?.cancel()
+            listenSource = nil
+            videoFD = -1
+            stdoutHandle = nil
+            stderrHandle = nil
+            videoHandle = nil
+            if listenFD >= 0 { close(listenFD); listenFD = -1 }
+            if !sockPath.isEmpty {
+                var st = stat()
+                if lstat(sockPath, &st) == 0, st.st_uid == getuid() { unlink(sockPath) }
+            }
+            leftover = Data()
+            videoLeftover = Data()
+        }
         watchTimer?.invalidate()
         watchTimer = nil
         Task { await finishWriter(cancel: true) }
@@ -189,8 +213,7 @@ final class AirPlayMirror: ObservableObject {
                 if let staleURL { try? FileManager.default.removeItem(at: staleURL) }
             }
         }
-        let size = sourceSize.width > 8 && sourceSize.height > 8
-            ? sourceSize : CGSize(width: 1170, height: 2532)
+        let size = Self.sanitizedSourceSize(sourceSize)
         let writer = try AVAssetWriter(url: url, fileType: .mov)
         writer.shouldOptimizeForNetworkUse = true
         writer.movieFragmentInterval = CMTime(seconds: 1, preferredTimescale: 600)
@@ -382,7 +405,9 @@ final class AirPlayMirror: ObservableObject {
         case "size":
             let w = (json["sourceWidth"] as? Double) ?? (json["width"] as? Double) ?? 0
             let h = (json["sourceHeight"] as? Double) ?? (json["height"] as? Double) ?? 0
-            if w > 8, h > 8 { sourceSize = CGSize(width: w, height: h) }
+            if w.isFinite, h.isFinite, w > 8, h > 8 {
+                sourceSize = Self.sanitizedSourceSize(CGSize(width: w, height: h))
+            }
             if status == .advertising || status == .connecting { status = .connecting }
         case "paused":
             applyLink(.paused)
@@ -400,8 +425,11 @@ final class AirPlayMirror: ObservableObject {
     }
 
     private func startVideoListener() -> String? {
-        let path = NSTemporaryDirectory() + "record-iphone-airplay.sock"
-        unlink(path)
+        // Random per-run name: a fixed path let any local process predict
+        // where to inject frames or race the helper's reconnect.
+        let path = NSTemporaryDirectory() + "record-iphone-airplay-\(UUID().uuidString).sock"
+        var st = stat()
+        if lstat(path, &st) == 0, st.st_uid == getuid() { unlink(path) }
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         guard var addr = Self.unixSockaddr(path: path) else {
@@ -414,6 +442,13 @@ final class AirPlayMirror: ObservableObject {
         }
         guard bound == 0, listen(fd, 1) == 0 else {
             close(fd)
+            return nil
+        }
+        // fchmod on a socket descriptor does not reliably set the socket
+        // file's permissions — chmod the path after bind instead.
+        guard chmod(path, 0o700) == 0 else {
+            close(fd)
+            unlink(path)
             return nil
         }
         let flags = fcntl(fd, F_GETFL, 0)
@@ -481,13 +516,21 @@ final class AirPlayMirror: ObservableObject {
     }
 
     private func readEvents(_ handle: FileHandle) {
+        // Stale events from a previous run must not reach a later session:
+        // capture the run epoch when the handler is installed and drop any
+        // chunk whose epoch no longer matches (checked on ioQueue).
+        let installedGen = ioGeneration
         handle.readabilityHandler = { [weak self] h in
             let data = h.availableData
             if data.isEmpty {
                 h.readabilityHandler = nil
                 return
             }
-            self?.consumeEvents(data)
+            guard let self else { return }
+            self.ioQueue.async {
+                guard installedGen == self.ioGeneration else { return }
+                self.consumeEvents(data)
+            }
         }
     }
 
@@ -519,6 +562,13 @@ final class AirPlayMirror: ObservableObject {
             let bytes = [UInt8](buffer.prefix(5))
             let type = bytes[0]
             let len = UInt32(bytes[1]) << 24 | UInt32(bytes[2]) << 16 | UInt32(bytes[3]) << 8 | UInt32(bytes[4])
+            // The helper never frames anything this large; a bogus length
+            // means the sender is not our helper — drop the stream instead
+            // of buffering without limit.
+            if len > Self.maxFramePayload {
+                buffer.removeAll(keepingCapacity: false)
+                return
+            }
             let total = 5 + Int(len)
             guard buffer.count >= total else { return }
             let payload = buffer.subdata(in: buffer.startIndex + 5 ..< buffer.startIndex + total)

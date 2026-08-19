@@ -33,9 +33,12 @@
 #include <openssl/pem.h>
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "utils.h"
 
@@ -386,12 +389,18 @@ ed25519_key_t *ed25519_key_generate(const char *device_id, const char *keyfile, 
     assert(key);
    
     if (use_keyfile) {
-        file = fopen(keyfile, "r");
-        if (file) {
-            bp = BIO_new_fp(file, BIO_NOCLOSE);
-            key->pkey = PEM_read_PrivateKey(file, NULL, NULL, NULL);
-            BIO_free(bp);
-            fclose(file);
+        int rfd = open(keyfile, O_RDONLY);
+        if (rfd >= 0) {
+            (void)fchmod(rfd, 0600); /* repair keys created before hardening */
+            file = fdopen(rfd, "r");
+            if (file) {
+                bp = BIO_new_fp(file, BIO_NOCLOSE);
+                key->pkey = PEM_read_PrivateKey(file, NULL, NULL, NULL);
+                BIO_free(bp);
+                fclose(file);
+            } else {
+                close(rfd);
+            }
             if (!key->pkey) {
                 new_pk = true;
             }
@@ -423,13 +432,21 @@ ed25519_key_t *ed25519_key_generate(const char *device_id, const char *keyfile, 
         }
         EVP_PKEY_CTX_free(pctx);
         if (use_keyfile) {
-            file = fopen(keyfile, "w");
+            /* Create the private key 0600 — fopen("w") would leave it
+               world-readable under the default umask. */
+            int kfd = open(keyfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (kfd >= 0) {
+                (void)fchmod(kfd, 0600); /* also repairs a pre-existing file */
+                file = fdopen(kfd, "w");
+            }
             if (file) {
                 bp = BIO_new_fp(file, BIO_NOCLOSE);
                 PEM_write_bio_PrivateKey(bp, key->pkey, NULL, NULL, 0, NULL, NULL);
                 BIO_free(bp);
                 fclose(file);
                 *result = 1;
+            } else if (kfd >= 0) {
+                close(kfd);
             }
         }
     }
