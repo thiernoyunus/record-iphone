@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 
 /// Shared canvas math so the editor preview and the export aim at the same spot.
@@ -43,8 +44,27 @@ enum CanvasDraw {
 struct CanvasBackdrop: View {
     var customRGB: [CGFloat]?
     var preset: BackgroundPreset
+    var wallpaperID: String? = nil
+    /// Editor playhead. Nil in the live recorder, where a live clip just loops.
+    var time: Double? = nil
+    var playing: Bool = true
 
     var body: some View {
+        if let id = wallpaperID, let paper = WallpaperCatalog.paper(id: id) {
+            if paper.isLive, let url = WallpaperCatalog.resourceURL(id: id) {
+                LiveWallpaperFill(url: url, time: time, playing: playing)
+            } else if let image = WallpaperCatalog.nsImage(id: id) {
+                WallpaperFill(image: image)
+            } else {
+                solidFill
+            }
+        } else {
+            solidFill
+        }
+    }
+
+    @ViewBuilder
+    private var solidFill: some View {
         if let rgb = customRGB, rgb.count >= 3 {
             Color(red: rgb[0], green: rgb[1], blue: rgb[2])
         } else {
@@ -59,6 +79,171 @@ struct CanvasBackdrop: View {
                 endPoint: .bottom
             )
         }
+    }
+}
+
+/// Aspect-fill photo that never uses SwiftUI Image or clipShape.
+/// Those paths can hand Quartz a NaN layer position and abort the app.
+struct WallpaperFill: View {
+    let image: NSImage
+    var corner: CGFloat = 0
+
+    var body: some View {
+        Representable(image: image, corner: corner)
+    }
+
+    private struct Representable: NSViewRepresentable {
+        let image: NSImage
+        let corner: CGFloat
+
+        func makeNSView(context: Context) -> FillImageView {
+            let view = FillImageView()
+            view.image = image
+            view.corner = corner
+            return view
+        }
+
+        func updateNSView(_ nsView: FillImageView, context: Context) {
+            nsView.image = image
+            nsView.corner = corner
+        }
+
+        func sizeThatFits(_ proposal: ProposedViewSize, nsView: FillImageView, context: Context) -> CGSize? {
+            let width = proposal.width ?? 0
+            let height = proposal.height ?? 0
+            guard width.isFinite, height.isFinite else { return CGSize(width: 1, height: 1) }
+            return CGSize(width: max(1, width), height: max(1, height))
+        }
+    }
+}
+
+final class FillImageView: NSView {
+    var image: NSImage? {
+        didSet { layer?.contents = image }
+    }
+    var corner: CGFloat = 0 {
+        didSet { layer?.cornerRadius = corner }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.contentsGravity = .resizeAspectFill
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+
+/// Looping silent clip behind the phone. Editor passes playhead time so
+/// preview and export show the same moment; the live recorder just loops.
+struct LiveWallpaperFill: View {
+    let url: URL
+    var corner: CGFloat = 0
+    var time: Double? = nil
+    var playing: Bool = true
+
+    var body: some View {
+        Representable(url: url, corner: corner, time: time, playing: playing)
+    }
+
+    private struct Representable: NSViewRepresentable {
+        let url: URL
+        let corner: CGFloat
+        let time: Double?
+        let playing: Bool
+
+        func makeNSView(context: Context) -> LoopingPlayerView {
+            let view = LoopingPlayerView()
+            view.load(url)
+            view.corner = corner
+            view.sync(time: time, playing: playing)
+            return view
+        }
+
+        func updateNSView(_ nsView: LoopingPlayerView, context: Context) {
+            nsView.load(url)
+            nsView.corner = corner
+            nsView.sync(time: time, playing: playing)
+        }
+    }
+}
+
+final class LoopingPlayerView: NSView {
+    private let player = AVPlayer()
+    private var playerLayer: AVPlayerLayer?
+    private var loopObserver: NSObjectProtocol?
+    private var loadedURL: URL?
+    private var duration: Double = 0
+
+    var corner: CGFloat = 0 {
+        didSet { layer?.cornerRadius = corner }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        let video = AVPlayerLayer(player: player)
+        video.videoGravity = .resizeAspectFill
+        video.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        layer?.addSublayer(video)
+        playerLayer = video
+        player.isMuted = true
+        player.actionAtItemEnd = .none
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        playerLayer?.frame = bounds
+    }
+
+    func load(_ url: URL) {
+        guard loadedURL != url else { return }
+        loadedURL = url
+        if let loopObserver {
+            NotificationCenter.default.removeObserver(loopObserver)
+        }
+        let item = AVPlayerItem(url: url)
+        duration = CMTimeGetSeconds(item.asset.duration)
+        player.replaceCurrentItem(with: item)
+        loopObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            self?.player.seek(to: .zero)
+            self?.player.play()
+        }
+    }
+
+    func sync(time: Double?, playing: Bool) {
+        if let time {
+            let looped = WallpaperCatalog.loopedTime(time, duration: duration > 0.05 ? duration : 20)
+            let now = player.currentTime().seconds
+            let drift = abs(now - looped)
+            let threshold = playing ? 0.35 : 0.04
+            if drift > threshold {
+                player.seek(to: CMTime(seconds: looped, preferredTimescale: 600),
+                            toleranceBefore: .zero, toleranceAfter: .zero)
+            }
+            if playing {
+                if player.rate == 0 { player.play() }
+            } else {
+                player.pause()
+            }
+        } else {
+            if playing, player.rate == 0 { player.play() }
+        }
+    }
+
+    deinit {
+        if let loopObserver {
+            NotificationCenter.default.removeObserver(loopObserver)
+        }
+        player.pause()
     }
 }
 

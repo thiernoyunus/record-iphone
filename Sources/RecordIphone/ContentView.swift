@@ -180,7 +180,7 @@ struct ContentView: View {
                     cameraBubble(in: geo.size, layout: layout, lockedCenter: !showPhone)
                 }
                 if engine.freezeLivePreview || isFinishing {
-                    canvasFill.opacity(0.92)
+                    solidCanvasFill.opacity(0.92)
                         .overlay(
                             VStack(spacing: 10) {
                                 ProgressView().controlSize(.large)
@@ -194,14 +194,19 @@ struct ContentView: View {
             }
         }
         .modifier(CanvasShape(preset: engine.canvas, phoneAspect: engine.phoneAspect))
-        .background(canvasFill)
+        .background(solidCanvasFill)
         .clipShape(RoundedRectangle(cornerRadius: engine.canvas == .device ? 0 : 18, style: .continuous))
         .shadow(color: .black.opacity(engine.canvas == .device ? 0 : 0.08), radius: 18, y: 6)
     }
 
     private var canvasFill: some View {
         CanvasBackdrop(customRGB: engine.customBackgroundRGB,
-                       preset: engine.background)
+                       preset: engine.background,
+                       wallpaperID: engine.wallpaperID)
+    }
+
+    private var solidCanvasFill: some View {
+        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background)
     }
 
     @ViewBuilder
@@ -1101,6 +1106,7 @@ struct ContentView: View {
     private func resetLook() {
         engine.background = .snow
         engine.customBackgroundRGB = [1, 1, 1]
+        engine.wallpaperID = nil
         engine.canvas = .device
         engine.presenterLayout = .floating
         engine.deviceOnLeft = true

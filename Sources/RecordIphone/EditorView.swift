@@ -411,7 +411,8 @@ struct EditorView: View {
     }
 
     private var stageFill: some View {
-        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background)
+        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background,
+                       time: editor.currentTime, playing: editor.isPlaying)
     }
 
     // MARK: - Transport + timeline
@@ -574,15 +575,26 @@ struct EditorView: View {
             chromeMenu(title: "Style", value: styleName) {
                 ForEach(SolidSwatch.styleMenu) { swatch in
                     Button(swatch.name) {
+                        engine.wallpaperID = nil
                         engine.customBackgroundRGB = [swatch.rgb.0, swatch.rgb.1, swatch.rgb.2]
                         editor.refreshPreview(immediate: true)
                     }
                 }
+                Divider()
+                ForEach(WallpaperCatalog.live) { paper in
+                    Button(paper.name) {
+                        engine.wallpaperID = paper.id
+                        editor.refreshPreview(immediate: true)
+                    }
+                }
+                ForEach(WallpaperCatalog.stills.prefix(8)) { paper in
+                    Button(paper.name) {
+                        engine.wallpaperID = paper.id
+                        editor.refreshPreview(immediate: true)
+                    }
+                }
             } trailing: {
-                Circle()
-                    .fill(Color(red: engine.customBackgroundRGB?[safe: 0] ?? 1,
-                                green: engine.customBackgroundRGB?[safe: 1] ?? 1,
-                                blue: engine.customBackgroundRGB?[safe: 2] ?? 1))
+                styleSwatch
                     .frame(width: 10, height: 10)
                     .overlay(Circle().strokeBorder(Color.black.opacity(0.15)))
             }
@@ -605,6 +617,9 @@ struct EditorView: View {
     }
 
     private var styleName: String {
+        if let paper = WallpaperCatalog.paper(id: engine.wallpaperID) {
+            return paper.name
+        }
         let rgb = (
             engine.customBackgroundRGB?[safe: 0] ?? 1,
             engine.customBackgroundRGB?[safe: 1] ?? 1,
@@ -617,6 +632,17 @@ struct EditorView: View {
             return named.name
         }
         return "Custom"
+    }
+
+    @ViewBuilder
+    private var styleSwatch: some View {
+        if let id = engine.wallpaperID, let image = WallpaperCatalog.nsImage(id: id) {
+            WallpaperFill(image: image, corner: 5)
+        } else {
+            Color(red: engine.customBackgroundRGB?[safe: 0] ?? 1,
+                  green: engine.customBackgroundRGB?[safe: 1] ?? 1,
+                  blue: engine.customBackgroundRGB?[safe: 2] ?? 1)
+        }
     }
 
     private func chromeMenu<C: View, T: View>(
@@ -753,7 +779,9 @@ private struct DualReviewCanvas: View {
     }
 
     private var canvasFill: some View {
-        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background)
+        CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background,
+                       wallpaperID: engine.wallpaperID,
+                       time: editor.currentTime, playing: editor.isPlaying)
     }
 
     private func phoneLayer(screen: CGRect, zoomScale: CGFloat,

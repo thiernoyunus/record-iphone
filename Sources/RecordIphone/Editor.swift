@@ -66,6 +66,7 @@ final class EditorState: ObservableObject {
         /// CaptureEngine.openProject so reopened projects stay in sync.
         var cameraOffsetSeconds: Double?
         var customBackgroundRGB: [CGFloat]?
+        var wallpaperID: String?
         var cameraShape: CameraShape?
         var ringRGB: [CGFloat]?
         var frameStyle: DeviceFrameStyle?
@@ -448,6 +449,7 @@ final class EditorState: ObservableObject {
                                     ExportLayout.phoneScaleMax)
         }
         if let rgb = doc.customBackgroundRGB { engine.customBackgroundRGB = rgb }
+        engine.wallpaperID = doc.wallpaperID
         if let shape = doc.cameraShape { engine.cameraShape = shape }
         if let ring = doc.ringRGB { engine.ringRGB = ring }
         if let frame = doc.frameStyle { engine.frameStyle = frame; engine.showBezel = frame.showsBezel }
@@ -780,6 +782,7 @@ final class EditorState: ObservableObject {
             phoneScale: engine.phoneScale,
             cameraOffsetSeconds: cameraOffset.seconds,
             customBackgroundRGB: engine.customBackgroundRGB,
+            wallpaperID: engine.wallpaperID,
             cameraShape: engine.cameraShape,
             ringRGB: engine.ringRGB,
             frameStyle: engine.frameStyle,
@@ -818,6 +821,7 @@ final class EditorState: ObservableObject {
         var cameraShape: CameraShape
         var ringRGB: [CGFloat]
         var customBackgroundRGB: [CGFloat]?
+        var wallpaperID: String?
         var frameStyle: DeviceFrameStyle
         var deviceOnLeft: Bool
         var cameraLeads: Bool
@@ -845,6 +849,7 @@ final class EditorState: ObservableObject {
                      cameraShape: engine.cameraShape,
                      ringRGB: engine.ringRGB,
                      customBackgroundRGB: engine.customBackgroundRGB,
+                     wallpaperID: engine.wallpaperID,
                      frameStyle: engine.frameStyle,
                      deviceOnLeft: engine.deviceOnLeft,
                      cameraLeads: engine.cameraLeads,
@@ -891,6 +896,7 @@ final class EditorState: ObservableObject {
         engine.cameraShape = s.cameraShape
         engine.ringRGB = s.ringRGB
         engine.customBackgroundRGB = s.customBackgroundRGB
+        engine.wallpaperID = s.wallpaperID
         engine.frameStyle = s.frameStyle
         engine.deviceOnLeft = s.deviceOnLeft
         engine.cameraLeads = s.cameraLeads

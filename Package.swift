@@ -7,6 +7,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "RecordIphone",
+            resources: [.copy("Resources/Wallpapers")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
