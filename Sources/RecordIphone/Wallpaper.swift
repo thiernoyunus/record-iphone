@@ -18,6 +18,13 @@ enum WallpaperCatalog {
 
     static let live: [Paper] = [
         .init(id: "wispysky", name: "Wispy Sky", ext: "mp4"),
+        .init(id: "lavaflow", name: "Lava Flow", ext: "mp4"),
+        .init(id: "mountainroad", name: "Mountain Road", ext: "mp4"),
+        .init(id: "winterforest", name: "Winter Forest", ext: "mp4"),
+        .init(id: "turquoisecoast", name: "Turquoise Coast", ext: "mp4"),
+        .init(id: "sunrisepeaks", name: "Sunrise Peaks", ext: "mp4"),
+        .init(id: "moonlight", name: "Moonlight", ext: "mp4"),
+        .init(id: "sunlitcliffs", name: "Sunlit Cliffs", ext: "mp4"),
     ]
 
     static let stills: [Paper] = [
@@ -167,6 +174,11 @@ enum WallpaperCatalog {
             ("wallpaper ids are unique", Set(all.map(\.id)).count == all.count),
             ("Wispy Sky is the live wallpaper",
              live.contains(where: { $0.id == "wispysky" && $0.isLive })),
+            ("eight live wallpapers are registered", live.count == 8),
+            ("all live wallpaper files are bundled",
+             live.allSatisfy { resourceURL(id: $0.id) != nil }),
+            ("downloaded live wallpapers are 20 seconds",
+             live.dropFirst().allSatisfy { abs(duration(id: $0.id) - 20) < 0.25 }),
             ("looped time wraps inside the clip",
              abs(loopedTime(21, duration: 20) - 1) < 0.001),
         ]
