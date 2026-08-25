@@ -40,7 +40,7 @@ struct LookControls: View {
 
     private var layoutBody: some View {
         VStack(alignment: .leading, spacing: 14) {
-            if showsCamera {
+            if showsCamera, engine.hasPhoneSource {
                 HStack(spacing: 8) {
                     layoutChoice("Camera bubble", selected: engine.presenterLayout == .floating) {
                         engine.presenterLayout = .floating
@@ -59,7 +59,7 @@ struct LookControls: View {
                 }
             }
 
-            if showsCamera, engine.presenterLayout == .floating {
+            if showsCamera, engine.hasPhoneSource, engine.presenterLayout == .floating {
                 Text("Position").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
                     ForEach(0..<9, id: \.self) { i in
@@ -188,6 +188,22 @@ struct LookControls: View {
 
     private var canvasBody: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Text("Color").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
+            colorGrid(SolidSwatch.solids)
+            Text("Soft").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
+            colorGrid(SolidSwatch.pastels)
+            HStack {
+                Text("Hex").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
+                TextField("#FFFFFF", text: $hexDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    .onSubmit { applyHex() }
+                Button("Apply") { applyHex() }
+                    .font(.system(size: 11, weight: .semibold))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Frame.accent)
+            }
+
             Text("Recommended").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
             HStack(spacing: 8) {
                 canvasCard(.device)
@@ -207,22 +223,6 @@ struct LookControls: View {
                     engine.phoneScale = ExportLayout.phoneScaleMax - $0 + ExportLayout.phoneScaleMin
                 }
             ), range: ExportLayout.phoneScaleMin...ExportLayout.phoneScaleMax)
-
-            Text("Background").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
-            colorGrid(SolidSwatch.solids)
-            Text("Soft").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
-            colorGrid(SolidSwatch.pastels)
-            HStack {
-                Text("Hex").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
-                TextField("#FFFFFF", text: $hexDraft)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, design: .monospaced))
-                    .onSubmit { applyHex() }
-                Button("Apply") { applyHex() }
-                    .font(.system(size: 11, weight: .semibold))
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Frame.accent)
-            }
         }
     }
 

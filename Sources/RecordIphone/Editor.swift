@@ -80,6 +80,7 @@ final class EditorState: ObservableObject {
         var phoneAudioLevel: CGFloat?
         var micAudioLevel: CGFloat?
         var wantedCamera: Bool?
+        var hasPhoneSource: Bool?
     }
 
     let dir: URL
@@ -97,6 +98,7 @@ final class EditorState: ObservableObject {
     /// them — that stitch has to run on the main thread and froze the app.
     let cameraPlayer = AVPlayer()
     @Published var hasCamera = false
+    @Published var hasPhone = true
     @Published var wantedCamera = false
     @Published var hasMic = false
     /// True only when camera.mov actually has a sound track (your voice).
@@ -265,9 +267,18 @@ final class EditorState: ObservableObject {
     }
 
     private func load() async {
-        // Phone file is required; camera may be a placeholder (same path).
         let phoneSize = (try? phoneURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        if phoneSize < 1024 {
+        let cameraSize = (try? cameraURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let sameFile = phoneURL.standardizedFileURL == cameraURL.standardizedFileURL
+        hasPhone = !sameFile && phoneSize >= 1024
+        if !hasPhone {
+            if cameraSize < 1024 {
+                loadFailed = "This recording looks incomplete. Try recording again."
+                return
+            }
+            engine.hasPhoneSource = false
+            engine.cameraEnabled = true
+        } else if phoneSize < 1024 {
             loadFailed = "This recording looks incomplete (phone video is nearly empty). The connection may have dropped during the take."
             return
         }
@@ -348,9 +359,10 @@ final class EditorState: ObservableObject {
         installPhoneOnlyItem()
         let camURL = playbackCameraURL
         let phoneURL = playbackPhoneURL
-        let camExists = camURL.standardizedFileURL != phoneURL.standardizedFileURL
+        let distinctCam = camURL.standardizedFileURL != phoneURL.standardizedFileURL
             && FileManager.default.fileExists(atPath: camURL.path)
             && ((try? camURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 1024
+        let camExists = distinctCam || !hasPhone
         let hasPicture: Bool
         let camHasAudio: Bool
         if camExists {
@@ -784,7 +796,8 @@ final class EditorState: ObservableObject {
             screenCorners: engine.screenCorners,
             phoneAudioLevel: phoneMix,
             micAudioLevel: micMix,
-            wantedCamera: wantedCamera)
+            wantedCamera: wantedCamera,
+            hasPhoneSource: engine.hasPhoneSource)
         if let data = try? JSONEncoder().encode(doc) {
             try? data.write(to: projectURL, options: .atomic)
         }

@@ -331,6 +331,38 @@ enum EditorLogicTests {
             else { lines.append("FAIL \(name)"); failed += 1 }
         }
 
+        let splitLook = ExportLayout(
+            bubbleCenter: CGPoint(x: 0.82, y: 0.78), bubbleFraction: 0.22,
+            canvas: CGSize(width: 1920, height: 1080), background: .snow, showBezel: false,
+            presenterLayout: .split, deviceOnLeft: true)
+        let phoneOnly = splitLook.soloCentered(showPhone: true, showCamera: false)
+        expect("phone-only leaves the side-by-side layout and sits in the middle",
+               phoneOnly.presenterLayout == .floating)
+        let both = splitLook.soloCentered(showPhone: true, showCamera: true)
+        expect("phone plus camera keep the left/right layout",
+               both.presenterLayout == .split && both.deviceOnLeft)
+        let camOnly = splitLook.soloCentered(showPhone: false, showCamera: true)
+        expect("camera-only sits in the middle of the canvas",
+               camOnly.presenterLayout == .floating
+               && abs(camOnly.bubbleCenter.x - 0.5) < 0.001
+               && abs(camOnly.bubbleCenter.y - 0.5) < 0.001)
+        var noPhone = splitLook
+        noPhone.hasPhoneSource = false
+        noPhone.cameraEnabled = true
+        expect("a take with no phone defaults to the camera scene",
+               noPhone.scene(at: 1) == .camera)
+        expect("scene appearance is 0 at the cut and 1 after a beat",
+               ExportLayout.appearanceProgress(at: 2.0, layout: {
+                   var l = splitLook
+                   l.scenes = [SceneClip(kind: .camera, start: 2, duration: 4)]
+                   return l
+               }()) < 0.01
+               && ExportLayout.appearanceProgress(at: 2.5, layout: {
+                   var l = splitLook
+                   l.scenes = [SceneClip(kind: .camera, start: 2, duration: 4)]
+                   return l
+               }()) > 0.99)
+
         expect("wanted + missing file is a lost camera clip",
                CameraClipStatus.resolve(wantedCamera: true, cameraFileExists: false, hasVideoTrack: false) == .wantedButMissing)
         expect("no camera on + no file is phone-only",
