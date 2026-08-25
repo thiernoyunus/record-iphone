@@ -149,35 +149,35 @@ struct ContentView: View {
 
     private var canvas: some View {
         GeometryReader { geo in
-            let layout = engine.presenterLayout == .split ? engine.currentLayout() : nil
+            let showPhone = showsLiveDevice
+            let showCamera = engine.cameraEnabled && !engine.freezeLivePreview && !isFinishing
+            let layout = engine.currentLayout().soloCentered(showPhone: showPhone, showCamera: showCamera)
             ZStack {
                 canvasFill
-                if engine.connectionKind == .wireless {
-                    if engine.hasLiveDevice {
+                if showPhone {
+                    if engine.connectionKind == .wireless {
                         devicePreview(in: geo.size, layout: layout)
                         if let message = engine.airplay.overlayMessage {
                             wirelessOverlay(message)
                         }
-                    } else if engine.airplay.isLive || engine.showConnectSheet {
+                    } else {
+                        // Keep the preview view mounted the whole time a cable
+                        // phone is selected. Swapping it for the spinner is what
+                        // froze the window on "Connecting…".
+                        devicePreview(in: geo.size, layout: layout)
+                        if !engine.phoneReady || !engine.phoneSessionRunning {
+                            reconnectingState
+                        }
+                    }
+                } else if !showCamera {
+                    if engine.connectionKind == .wireless, engine.airplay.isLive || engine.showConnectSheet {
                         wirelessWaitState
                     } else {
                         emptyState
                     }
-                } else if engine.selectedPhone != nil {
-                    // Keep the preview view mounted the whole time a cable
-                    // phone is selected. Swapping it for the spinner is what
-                    // froze the window on "Connecting…".
-                    devicePreview(in: geo.size, layout: layout)
-                    if !engine.phoneReady || !engine.phoneSessionRunning {
-                        reconnectingState
-                    }
-                } else {
-                    emptyState
                 }
-                // Never draw the camera on the Connect card — that's the
-                // "bubble while I'm not recording" bug.
-                if engine.cameraEnabled, showsLiveDevice, !engine.freezeLivePreview {
-                    cameraBubble(in: geo.size, layout: layout)
+                if showCamera {
+                    cameraBubble(in: geo.size, layout: layout, lockedCenter: !showPhone)
                 }
                 if engine.freezeLivePreview || isFinishing {
                     canvasFill.opacity(0.92)
@@ -219,7 +219,7 @@ struct ContentView: View {
         }
     }
 
-    private func devicePreview(in size: CGSize, layout: ExportLayout?) -> some View {
+    private func devicePreview(in size: CGSize, layout: ExportLayout) -> some View {
         let (frame, w, h) = phoneFrame(in: size, layout: layout)
         return FramedPhoneChrome(
             width: w,
@@ -253,34 +253,34 @@ struct ContentView: View {
         .position(x: frame.midX, y: frame.midY)
     }
 
-    private func phoneFrame(in size: CGSize, layout: ExportLayout?) -> (CGRect, CGFloat, CGFloat) {
+    private func phoneFrame(in size: CGSize, layout: ExportLayout) -> (CGRect, CGFloat, CGFloat) {
         let r = CanvasDraw.phoneScreenRect(
             canvas: size,
-            layout: layout ?? engine.currentLayout(),
+            layout: layout,
             phoneAspect: engine.phoneAspect)
         return (r, r.width, r.height)
     }
 
-    private func cameraBubble(in size: CGSize, layout: ExportLayout?) -> some View {
+    private func cameraBubble(in size: CGSize, layout: ExportLayout, lockedCenter: Bool = false) -> some View {
         let busy: Bool = {
             switch engine.phase {
             case .idle: return false
             default: return true
             }
         }()
-        let frac = min(max(engine.bubbleFraction, ExportLayout.bubbleMin), ExportLayout.bubbleMax)
+        let frac = min(max(layout.bubbleFraction, ExportLayout.bubbleMin), ExportLayout.bubbleMax)
         let aspect: CGFloat = engine.cameraShape == .rectangle ? 4 / 5 : 1
         let (w, h, center, corner): (CGFloat, CGFloat, CGPoint, CGFloat) = {
-            switch engine.presenterLayout {
+            switch layout.presenterLayout {
             case .floating:
                 let s = frac * min(size.width, size.height)
                 let hh = s
                 let ww = s * aspect
                 let cr: CGFloat = engine.cameraShape == .circle ? 0.5
                     : (engine.cameraShape == .square ? 0.18 : 0.14)
-                return (ww, hh, dragBubble ?? engine.bubbleCenter, cr)
+                return (ww, hh, dragBubble ?? layout.bubbleCenter, cr)
             case .split:
-                let zone = ExportLayout.splitZones(canvas: size, layout: layout ?? engine.currentLayout()).camera
+                let zone = ExportLayout.splitZones(canvas: size, layout: layout).camera
                 let fit = min(zone.width / aspect, zone.height) * 0.92
                 let cr: CGFloat = engine.cameraShape == .circle ? 0.5 : 0.10
                 return (fit * aspect, fit,
@@ -308,12 +308,12 @@ struct ContentView: View {
         }
         .position(x: center.x * size.width, y: center.y * size.height)
         .gesture(DragGesture().onChanged { value in
-            guard !busy, engine.presenterLayout == .floating else { return }
+            guard !busy, !lockedCenter, layout.presenterLayout == .floating else { return }
             dragBubble = CGPoint(
                 x: min(max(value.location.x / size.width, 0.08), 0.92),
                 y: min(max(value.location.y / size.height, 0.08), 0.92))
         }.onEnded { value in
-            guard !busy, engine.presenterLayout == .floating else {
+            guard !busy, !lockedCenter, layout.presenterLayout == .floating else {
                 dragBubble = nil
                 return
             }
@@ -352,7 +352,7 @@ struct ContentView: View {
             Text("Connect your iPhone")
                 .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(Frame.label)
-            Text("Plug in a cable, or use Screen Mirroring over Wi‑Fi.")
+            Text("Plug in a cable, mirror over Wi‑Fi, or record just the Mac camera.")
                 .font(.system(size: 13))
                 .foregroundStyle(Frame.secondary)
             HStack(spacing: 10) {
@@ -368,6 +368,10 @@ struct ContentView: View {
                             icon: "airplayvideo",
                             action: { engine.startWireless() })
             }
+            connectCard(title: "Record just a camera",
+                        subtitle: "Mac camera · no phone",
+                        icon: "web.camera",
+                        action: { engine.startCameraOnly() })
             if !engine.recentProjects.isEmpty {
                 Divider().frame(width: 140).padding(.top, 6)
                 Text("Recent").font(.caption.weight(.semibold)).foregroundStyle(Frame.tertiary)
@@ -638,6 +642,7 @@ struct ContentView: View {
             if engine.airplay.isConnected { return engine.airplay.deviceName }
             return "Wireless…"
         }
+        if engine.connectionKind == .cameraOnly { return "Mac camera" }
         return engine.selectedPhone?.localizedName ?? "No device"
     }
 
@@ -657,8 +662,8 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .keyboardShortcut("r")
-        .disabled(!engine.phoneReady)
-        .opacity(engine.phoneReady ? 1 : 0.45)
+        .disabled(!engine.canRecord)
+        .opacity(engine.canRecord ? 1 : 0.45)
         .help("Start recording (⌘R)")
         .accessibilityIdentifier("recordButton")
     }
@@ -734,7 +739,7 @@ struct ContentView: View {
     // MARK: - Countdown
 
     private func beginCountdown() {
-        guard engine.phoneReady else { return }
+        guard engine.canRecord else { return }
         engine.setupOpen = false
         engine.prepareForRecording()
         countdownTask?.cancel()
@@ -743,7 +748,9 @@ struct ContentView: View {
             engine.startRecording()
             return
         }
-        engine.prearmRecording()
+        if engine.connectionKind != .cameraOnly {
+            engine.prearmRecording()
+        }
         countdown = beats
         countdownTask = Task { @MainActor in
             var n = beats
@@ -1171,7 +1178,7 @@ struct HomeLandingView: View {
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(Frame.label)
                 Spacer()
-                if engine.phoneReady || engine.hasLiveDevice {
+                if engine.phoneReady || engine.hasLiveDevice || engine.connectionKind == .cameraOnly {
                     Button("Live preview") { engine.enterLive() }
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(Frame.accent)
@@ -1194,6 +1201,12 @@ struct HomeLandingView: View {
                          subtitle: "Wi-Fi · no cable",
                          icon: "airplayvideo") {
                     engine.startWireless()
+                }
+                .disabled(engine.editorOpening)
+                homeCard(title: "Record just a camera",
+                         subtitle: "Mac camera · no phone",
+                         icon: "web.camera") {
+                    engine.startCameraOnly()
                 }
                 .disabled(engine.editorOpening)
             }
@@ -1307,7 +1320,16 @@ struct ProjectThumb: View {
         .frame(width: width, height: height)
         .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
         .task {
-            let url = dir.appendingPathComponent("phone.mov")
+            var url: URL?
+            for candidate in ProjectMediaSelection.candidates(in: dir) {
+                let size = (try? candidate.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                guard FileManager.default.fileExists(atPath: candidate.path), size > 1024 else { continue }
+                if await Exporter.movieHasUsableVideo(candidate) {
+                    url = candidate
+                    break
+                }
+            }
+            guard let url else { return }
             if let cached = Self.cache.object(forKey: url as NSURL) {
                 image = cached
                 return

@@ -83,6 +83,8 @@ struct ExportLayout: Codable, Equatable {
     var splitBalance: CGFloat = 0.55
     var splitGap: CGFloat = 0.08
     var scenes: [SceneClip] = []
+    /// False for a camera-only take (no iPhone in the recording).
+    var hasPhoneSource: Bool = true
 
     /// Default phone content height as a fraction of canvas height (floating layout).
     static let phoneHeightFraction: CGFloat = 0.84
@@ -119,7 +121,7 @@ struct ExportLayout: Codable, Equatable {
         case bubbleCenter, bubbleFraction, canvas, background, showBezel, presenterLayout, phoneScale
         case cameraShape, ringRGB, frameStyle, screenCorners, showBorder
         case customBackgroundRGB, wallpaperID, cameraEnabled, deviceOnLeft, cameraLeads
-        case overlapArrangement, splitBalance, splitGap, scenes
+        case overlapArrangement, splitBalance, splitGap, scenes, hasPhoneSource
     }
 
     init(bubbleCenter: CGPoint, bubbleFraction: CGFloat, canvas: CGSize,
@@ -139,7 +141,8 @@ struct ExportLayout: Codable, Equatable {
          overlapArrangement: Bool = false,
          splitBalance: CGFloat = 0.55,
          splitGap: CGFloat = 0.08,
-         scenes: [SceneClip] = []) {
+         scenes: [SceneClip] = [],
+         hasPhoneSource: Bool = true) {
         self.bubbleCenter = bubbleCenter
         self.bubbleFraction = bubbleFraction
         self.canvas = canvas
@@ -161,6 +164,7 @@ struct ExportLayout: Codable, Equatable {
         self.splitBalance = splitBalance
         self.splitGap = splitGap
         self.scenes = scenes
+        self.hasPhoneSource = hasPhoneSource
     }
 
     init(from decoder: Decoder) throws {
@@ -203,6 +207,7 @@ struct ExportLayout: Codable, Equatable {
             clip.duration = min(max(clip.duration, 0.4), 3600)
             return clip
         }
+        hasPhoneSource = try c.decodeIfPresent(Bool.self, forKey: .hasPhoneSource) ?? true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -228,13 +233,50 @@ struct ExportLayout: Codable, Equatable {
         try c.encode(splitBalance, forKey: .splitBalance)
         try c.encode(splitGap, forKey: .splitGap)
         try c.encode(scenes, forKey: .scenes)
+        try c.encode(hasPhoneSource, forKey: .hasPhoneSource)
     }
 
     func scene(at t: Double) -> SceneKind {
         if let hit = scenes.first(where: { t >= $0.start && t < $0.end }) {
             return hit.kind
         }
+        if !hasPhoneSource { return cameraEnabled ? .camera : .device }
         return cameraEnabled ? .both : .device
+    }
+
+    /// 0 → 1 over the first 0.45s of a scene, so a camera-only (or phone-only)
+    /// cut can ease into the middle instead of jumping.
+    static let appearDuration: Double = 0.45
+
+    static func appearanceProgress(at t: Double, layout: ExportLayout) -> CGFloat {
+        guard let hit = layout.scenes.first(where: { t >= $0.start && t < $0.end }) else { return 1 }
+        return CGFloat(min(1, max(0, (t - hit.start) / appearDuration)))
+    }
+
+    func blended(toward dest: ExportLayout, progress: CGFloat) -> ExportLayout {
+        let x = min(max(progress, 0), 1)
+        if x >= 0.999 { return dest }
+        let p = 1 - pow(1 - x, 3)
+        var next = dest
+        next.bubbleCenter = CGPoint(
+            x: bubbleCenter.x + (dest.bubbleCenter.x - bubbleCenter.x) * p,
+            y: bubbleCenter.y + (dest.bubbleCenter.y - bubbleCenter.y) * p)
+        next.bubbleFraction = bubbleFraction + (dest.bubbleFraction - bubbleFraction) * p
+        next.presenterLayout = x < 0.18 ? presenterLayout : dest.presenterLayout
+        return next
+    }
+
+    /// When only the phone or only the camera is on screen, sit that one in
+    /// the middle. Side-by-side (left/right) is for two subjects.
+    func soloCentered(showPhone: Bool, showCamera: Bool) -> ExportLayout {
+        var next = self
+        if showPhone && showCamera { return next }
+        next.presenterLayout = .floating
+        if showCamera && !showPhone {
+            next.bubbleCenter = CGPoint(x: 0.5, y: 0.5)
+            next.bubbleFraction = max(next.bubbleFraction, 0.48)
+        }
+        return next
     }
 
     // MARK: Split-mode zones — the ONE source of truth for split geometry.
@@ -447,19 +489,27 @@ enum Exporter {
         let phoneSkip = CMTime(seconds: align.phoneSkip, preferredTimescale: 600)
         let cameraSkip = CMTime(seconds: align.cameraSkip, preferredTimescale: 600)
 
-        let phoneSource = await joinedPhoneURL(from: phoneURL)
-        let readyPhone = try await ensureReadableMovie(phoneSource, label: "device")
         let cameraIsPhone = cameraURL.standardizedFileURL == phoneURL.standardizedFileURL
-        let readyCamera = cameraIsPhone ? nil : (try? await ensureReadableMovie(cameraURL, label: "camera"))
+        let phoneSource = await joinedPhoneURL(from: phoneURL)
+        let phoneLooksReal = !cameraIsPhone
+            && ((try? phoneSource.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 1024
+        let readyPhone = phoneLooksReal ? (try? await ensureReadableMovie(phoneSource, label: "device")) : nil
+        let readyCamera = try? await ensureReadableMovie(cameraURL, label: "camera")
+        if readyPhone == nil, readyCamera == nil {
+            throw ExportError.missingTrack("this take has no usable video.")
+        }
         // Precise timing only for export (quality over speed).
         let precise: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: true]
-        let phoneAsset = AVURLAsset(url: readyPhone, options: precise)
+        let phoneAsset = readyPhone.map { AVURLAsset(url: $0, options: precise) }
         let cameraAsset = readyCamera.map { AVURLAsset(url: $0, options: precise) }
 
-        guard let phoneVideo = try await addTrack(from: phoneAsset, type: .video,
-                                                  to: composition, at: phoneAt, skip: phoneSkip) else {
-            throw ExportError.missingTrack(
-                "the device recording has no usable video. Keep it unlocked and try again.")
+        var phoneTrackID = kCMPersistentTrackID_Invalid
+        var phoneRot: CGFloat = 0
+        if let phoneAsset,
+           let phoneVideo = try await addTrack(from: phoneAsset, type: .video,
+                                               to: composition, at: phoneAt, skip: phoneSkip) {
+            phoneTrackID = phoneVideo.trackID
+            phoneRot = try await rotationAngle(of: phoneAsset)
         }
         var cameraTrackID = kCMPersistentTrackID_Invalid
         var cameraRot: CGFloat = 0
@@ -470,10 +520,15 @@ enum Exporter {
             }
             cameraRot = try await rotationAngle(of: cameraAsset)
         }
+        if phoneTrackID == kCMPersistentTrackID_Invalid, cameraTrackID == kCMPersistentTrackID_Invalid {
+            throw ExportError.missingTrack(
+                "the device recording has no usable video. Keep it unlocked and try again.")
+        }
 
-        // Blend the phone's sound and the mic into ONE track.
-        let mixedAudio = readyPhone.deletingLastPathComponent().appendingPathComponent("mixed-audio.m4a")
-        var sources: [(AVURLAsset, CMTime)] = [(phoneAsset, phoneAt)]
+        let takeDir = (readyPhone ?? readyCamera ?? phoneURL).deletingLastPathComponent()
+        let mixedAudio = takeDir.appendingPathComponent("mixed-audio.m4a")
+        var sources: [(AVURLAsset, CMTime)] = []
+        if let phoneAsset { sources.append((phoneAsset, phoneAt)) }
         if let cameraAsset { sources.append((cameraAsset, cameraAt)) }
         var hadAnyAudio = false
         for (asset, _) in sources {
@@ -482,15 +537,14 @@ enum Exporter {
                 break
             }
         }
-        if !hadAnyAudio,
-           await joinedPhoneAudioURL(in: readyPhone.deletingLastPathComponent()) != nil {
+        if !hadAnyAudio, await joinedPhoneAudioURL(in: takeDir) != nil {
             hadAnyAudio = true
         }
         if hadAnyAudio {
             let phoneVol = Float(min(max(phoneAudioLevel, 0), 1))
             let micVol = Float(min(max(micAudioLevel, 0), 1))
-            var leveled: [(AVURLAsset, CMTime, Float, CMTime)] = [(phoneAsset, phoneAt, phoneVol, phoneSkip)]
-            let takeDir = readyPhone.deletingLastPathComponent()
+            var leveled: [(AVURLAsset, CMTime, Float, CMTime)] = []
+            if let phoneAsset { leveled.append((phoneAsset, phoneAt, phoneVol, phoneSkip)) }
             if let sidecar = await joinedPhoneAudioURL(in: takeDir) {
                 leveled.append((AVURLAsset(url: sidecar), phoneAt, phoneVol, phoneSkip))
             } else {
@@ -508,19 +562,24 @@ enum Exporter {
             }
         }
 
-        let phoneDur = (try? await phoneAsset.load(.duration).seconds) ?? 0
+        let phoneDur = phoneAsset == nil ? 0 : ((try? await phoneAsset!.load(.duration).seconds) ?? 0)
         let camDur = cameraAsset == nil ? 0 : ((try? await cameraAsset!.load(.duration).seconds) ?? 0)
         let phoneWin = ClipAlignment.clipWindow(fileDuration: phoneDur, at: align.phoneAt, skip: align.phoneSkip)
         let camWin = ClipAlignment.clipWindow(fileDuration: camDur, at: align.cameraAt, skip: align.cameraSkip)
+        var exportLayout = layout
+        if phoneTrackID == kCMPersistentTrackID_Invalid {
+            exportLayout.hasPhoneSource = false
+            exportLayout.cameraEnabled = true
+        }
         let videoComposition = makeVideoComposition(
             duration: try await composition.load(.duration),
-            phoneTrackID: phoneVideo.trackID,
+            phoneTrackID: phoneTrackID,
             cameraTrackID: cameraTrackID,
-            phoneRotation: try await rotationAngle(of: phoneAsset),
+            phoneRotation: phoneRot,
             cameraRotation: cameraRot,
-            layout: layout, zooms: zooms,
-            holdPhone: firstFrame(of: phoneAsset),
-            holdPhoneEnd: frame(of: phoneAsset, at: max(0, phoneDur - 0.08)),
+            layout: exportLayout, zooms: zooms,
+            holdPhone: phoneAsset.flatMap { firstFrame(of: $0) },
+            holdPhoneEnd: phoneAsset.flatMap { frame(of: $0, at: max(0, phoneDur - 0.08)) },
             holdCamera: cameraAsset.flatMap { firstFrame(of: $0) },
             holdCameraEnd: cameraAsset.flatMap { frame(of: $0, at: max(0, camDur - 0.08)) },
             phoneStart: phoneWin.start, phoneEnd: phoneWin.end,
@@ -560,7 +619,7 @@ enum Exporter {
         defer { progressWatcher.cancel() }
         try await session.export(to: outURL, as: .mp4)
         try? FileManager.default.removeItem(
-            at: readyPhone.deletingLastPathComponent().appendingPathComponent("mixed-audio.m4a"))
+            at: takeDir.appendingPathComponent("mixed-audio.m4a"))
         return outURL
     }
 
@@ -1321,11 +1380,14 @@ final class CanvasInstruction: NSObject, AVVideoCompositionInstructionProtocol, 
         self.phoneEnd = phoneEnd
         self.cameraStart = cameraStart
         self.cameraEnd = cameraEnd
-        var ids = [NSNumber(value: phoneTrackID)]
+        var ids: [NSNumber] = []
+        if phoneTrackID != kCMPersistentTrackID_Invalid {
+            ids.append(NSNumber(value: phoneTrackID))
+        }
         if cameraTrackID != kCMPersistentTrackID_Invalid {
             ids.append(NSNumber(value: cameraTrackID))
         }
-        self.requiredSourceTrackIDs = ids
+        self.requiredSourceTrackIDs = ids.isEmpty ? nil : ids
     }
 }
 
@@ -1365,11 +1427,13 @@ final class CanvasCompositor: NSObject, AVVideoCompositing {
         let bg = background(size: size, layout: instruction.layout, time: t)
         var content = bg
 
-        let layout = instruction.layout
+        let kind = instruction.layout.scene(at: t)
+        let showPhone = kind != .camera && instruction.layout.hasPhoneSource
+        let showCamera = kind != .device && instruction.layout.cameraEnabled
+        let dest = instruction.layout.soloCentered(showPhone: showPhone, showCamera: showCamera)
+        let appear = ExportLayout.appearanceProgress(at: t, layout: instruction.layout)
+        let layout = instruction.layout.blended(toward: dest, progress: appear)
         let isSplit = layout.presenterLayout == .split
-        let kind = layout.scene(at: t)
-        let showPhone = kind != .camera
-        let showCamera = kind != .device && layout.cameraEnabled
 
         let phoneImage: CIImage? = {
             guard showPhone else { return nil }

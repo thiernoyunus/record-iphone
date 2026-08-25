@@ -40,7 +40,7 @@ struct LookControls: View {
 
     private var layoutBody: some View {
         VStack(alignment: .leading, spacing: 14) {
-            if showsCamera {
+            if showsCamera, engine.hasPhoneSource {
                 HStack(spacing: 8) {
                     layoutChoice("Camera bubble", selected: engine.presenterLayout == .floating) {
                         engine.presenterLayout = .floating
@@ -59,7 +59,7 @@ struct LookControls: View {
                 }
             }
 
-            if showsCamera, engine.presenterLayout == .floating {
+            if showsCamera, engine.hasPhoneSource, engine.presenterLayout == .floating {
                 Text("Position").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
                     ForEach(0..<9, id: \.self) { i in
@@ -140,7 +140,7 @@ struct LookControls: View {
                         .buttonStyle(.plain)
                     }
                 }
-            } else if showsCamera {
+            } else if showsCamera, engine.hasPhoneSource {
                 Text("Focus").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
                 HStack(spacing: 6) {
                     layoutChoice("Device leads", selected: !engine.cameraLeads) {
@@ -176,7 +176,9 @@ struct LookControls: View {
                               ),
                               range: 0.02...0.22)
             } else {
-                Text(cameraStatus.layoutMessage)
+                Text(engine.hasPhoneSource
+                     ? cameraStatus.layoutMessage
+                     : "Camera-only recordings are centered automatically.")
                     .font(.system(size: 12))
                     .foregroundStyle(Frame.secondary)
                     .fixedSize(horizontal: false, vertical: true)
