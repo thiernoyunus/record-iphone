@@ -7,6 +7,7 @@ struct TimelineStrip: View {
     @State private var zoomDurationBase: [UUID: Double] = [:]
     @State private var trimStartBase: Double?
     @State private var trimEndBase: Double?
+    @State private var trimDragPPS: CGFloat?
     @State private var playheadBase: Double?
     @State private var hoverZoomX: CGFloat?
     @State private var snapGuideX: CGFloat?
@@ -18,22 +19,21 @@ struct TimelineStrip: View {
     var body: some View {
         GeometryReader { geo in
             let trackW = max(geo.size.width - labelW, 1)
-            let pps = trackW / max(editor.duration, 0.1)
+            let view = layoutWindow(trackWidth: trackW)
             let needleX = TimelineLayout.playheadX(
                 time: editor.currentTime,
-                duration: editor.duration,
-                trackWidth: trackW,
+                window: view,
                 labelWidth: labelW)
 
             ZStack(alignment: .topLeading) {
                 VStack(alignment: .leading, spacing: 6) {
-                    timeRuler(width: trackW, pps: pps)
+                    timeRuler(view: view)
                         .padding(.leading, labelW)
                     track(label: "Screen", height: 52) {
-                        filmstrip(width: trackW, pps: pps)
+                        filmstrip(view: view)
                     }
                     track(label: "Camera", height: 32) {
-                        cameraLane(width: trackW)
+                        cameraLane(view: view)
                     }
                     audioTrack(label: "iPhone",
                                muted: editor.phoneMuted,
@@ -44,7 +44,7 @@ struct TimelineStrip: View {
                                     cameraOffsetSeconds: editor.cameraOffset.seconds).phoneAt,
                                   span: editor.phoneAudioDuration,
                                   empty: "No iPhone sound on this take",
-                                  width: trackW)
+                                  view: view)
                     }
                     audioTrack(label: "Mic",
                                muted: editor.micMuted,
@@ -55,10 +55,10 @@ struct TimelineStrip: View {
                                     cameraOffsetSeconds: editor.cameraOffset.seconds).cameraAt,
                                   span: editor.micAudioDuration,
                                   empty: "No Mac mic — Sound was iPhone only",
-                                  width: trackW)
+                                  view: view)
                     }
                     track(label: "Zoom", height: 28) {
-                        zoomLane(width: trackW, pps: pps)
+                        zoomLane(view: view)
                     }
                 }
 
@@ -72,7 +72,7 @@ struct TimelineStrip: View {
 
                 // Needle sits on top so you can grab it. Trim / zoom use their
                 // own drags — this card does not steal those.
-                playheadNeedle(x: needleX, height: geo.size.height, trackWidth: trackW)
+                playheadNeedle(x: needleX, height: geo.size.height, view: view)
             }
         }
         .padding(10)
@@ -96,8 +96,28 @@ struct TimelineStrip: View {
         }
     }
 
-    private func timeOnTrack(x: CGFloat, trackWidth: CGFloat) -> Double {
-        min(max(Double(x / max(trackWidth, 1)) * editor.duration, 0), editor.duration)
+    /// Keep the old window while a trim handle is moving so the handle can
+    /// follow the pointer. At rest, only the kept range fills the timeline.
+    private func layoutWindow(trackWidth: CGFloat) -> TimelineLayout.KeepWindow {
+        let start = min(editor.trimStart, trimStartBase ?? editor.trimStart)
+        let end = max(editor.trimEnd, trimEndBase ?? editor.trimEnd)
+        return TimelineLayout.keepWindow(
+            trimStart: start,
+            trimEnd: end,
+            duration: editor.duration,
+            trackWidth: trackWidth)
+    }
+
+    /// Draw the full take, then move the kept range into the visible track.
+    private func keepLane<V: View>(view: TimelineLayout.KeepWindow, height: CGFloat,
+                                   @ViewBuilder content: () -> V) -> some View {
+        content()
+            .frame(width: max(1, view.fullWidth), height: height, alignment: .leading)
+            .offset(x: view.shift)
+            .frame(width: view.trackWidth, height: height, alignment: .leading)
+            .compositingGroup()
+            .clipped()
+            .contentShape(Rectangle())
     }
 
     private var playheadClock: String {
@@ -105,7 +125,8 @@ struct TimelineStrip: View {
         return String(format: "%02d:%02d", Int(t) / 60, Int(t) % 60)
     }
 
-    private func playheadNeedle(x: CGFloat, height: CGFloat, trackWidth: CGFloat) -> some View {
+    private func playheadNeedle(x: CGFloat, height: CGFloat,
+                                view: TimelineLayout.KeepWindow) -> some View {
         ZStack(alignment: .top) {
             VStack(spacing: 0) {
                 TimelineDiamond()
@@ -134,8 +155,8 @@ struct TimelineStrip: View {
                 playheadBase = editor.currentTime
                 isScrubbing = true
             }
-            let dt = Double(value.translation.width) / Double(max(trackWidth, 1)) * editor.duration
-            editor.seekRaw(to: (playheadBase ?? 0) + dt, precise: true)
+            let dt = Double(value.translation.width) / Double(max(view.trackWidth, 1)) * view.viewDur
+            editor.seek(to: (playheadBase ?? 0) + dt)
         }.onEnded { _ in
             playheadBase = nil
             isScrubbing = false
@@ -174,43 +195,68 @@ struct TimelineStrip: View {
         .frame(height: 28)
     }
 
-    private func timeRuler(width w: CGFloat, pps: CGFloat) -> some View {
-        let step: Double = editor.duration > 40 ? 5 : 2
-        let marks = stride(from: 0.0, through: editor.duration, by: step).map { $0 }
+    private func timeRuler(view: TimelineLayout.KeepWindow) -> some View {
+        let step: Double = view.viewDur > 40 ? 5 : 2
+        let marks = stride(from: 0.0, through: view.viewDur, by: step).map { $0 }
         return ZStack(alignment: .topLeading) {
             ForEach(marks, id: \.self) { t in
                 Text("\(Int(t))s")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(Frame.tertiary)
-                    .offset(x: max(0, t * pps - (t == 0 ? 0 : 8)))
+                    .offset(x: max(0, t * view.pps - (t == 0 ? 0 : 8)))
             }
         }
-        .frame(width: w, height: 12, alignment: .topLeading)
+        .frame(width: view.trackWidth, height: 12, alignment: .topLeading)
         .clipped()
         .contentShape(Rectangle())
         .gesture(DragGesture(minimumDistance: 0).onChanged { value in
             isScrubbing = true
-            editor.seekRaw(to: timeOnTrack(x: value.location.x, trackWidth: w), precise: true)
+            editor.seek(to: view.time(at: value.location.x))
         }.onEnded { _ in
             isScrubbing = false
         })
     }
 
-    private func filmstrip(width w: CGFloat, pps: CGFloat) -> some View {
+    private func filmstrip(view: TimelineLayout.KeepWindow) -> some View {
         let align = ClipAlignment.startAtMic(cameraOffsetSeconds: editor.cameraOffset.seconds)
         let span = max(0.05, editor.phoneFileDuration - align.phoneSkip)
         let placed = TimelineLayout.clipFrame(
             start: align.phoneAt, span: span,
-            timeline: editor.duration, trackWidth: w)
-        return EquatableView(content: FilmstripView(
-            thumbnails: editor.thumbnails,
-            width: w,
-            clipX: placed.x,
-            clipWidth: placed.width,
-            duration: editor.duration,
-            trimStart: editor.trimStart,
-            trimEnd: editor.trimEnd,
-            onTrim: { edge, dx in
+            timeline: editor.duration, trackWidth: view.fullWidth)
+        return ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.black.opacity(0.04))
+            keepLane(view: view, height: 52) {
+                EquatableView(content: FilmstripView(
+                    thumbnails: editor.thumbnails,
+                    clipX: placed.x,
+                    clipWidth: placed.width
+                ))
+            }
+            trimHandle(view: view, edge: .start)
+            trimHandle(view: view, edge: .end)
+        }
+        .frame(width: view.trackWidth, height: 52)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Frame.hairline))
+        .contentShape(Rectangle())
+        .onTapGesture(coordinateSpace: .local) { point in
+            editor.seek(to: view.time(at: point.x))
+        }
+    }
+
+    private func trimHandle(view: TimelineLayout.KeepWindow,
+                            edge: FilmstripView.TrimEdge) -> some View {
+        let time = edge == .start ? editor.trimStart : editor.trimEnd
+        let x = min(max(view.x(for: time), 5), max(5, view.trackWidth - 5))
+        return RoundedRectangle(cornerRadius: 2, style: .continuous)
+            .fill(Color.white)
+            .overlay(RoundedRectangle(cornerRadius: 2).strokeBorder(Color.black.opacity(0.2)))
+            .frame(width: 7, height: 52)
+            .offset(x: x - 3.5)
+            .highPriorityGesture(DragGesture(minimumDistance: 1).onChanged { value in
+                if trimDragPPS == nil { trimDragPPS = view.pps }
+                let dx = Double(value.translation.width) / Double(trimDragPPS ?? view.pps)
                 switch edge {
                 case .start:
                     if trimStartBase == nil { trimStartBase = editor.trimStart }
@@ -220,48 +266,45 @@ struct TimelineStrip: View {
                     editor.trimEnd = max(min(editor.duration, (trimEndBase ?? editor.duration) + dx),
                                          editor.trimStart + 0.5)
                 }
-            },
-            onTrimEnd: {
+            }.onEnded { _ in
                 trimStartBase = nil
                 trimEndBase = nil
+                trimDragPPS = nil
                 editor.applyTrimToPlayback()
-            }
-        ))
-        .onTapGesture(coordinateSpace: .local) { point in
-            editor.seekRaw(to: timeOnTrack(x: point.x, trackWidth: w), precise: true)
-        }
+            })
     }
 
-    private func cameraLane(width w: CGFloat) -> some View {
+    private func cameraLane(view: TimelineLayout.KeepWindow) -> some View {
         let align = ClipAlignment.startAtMic(cameraOffsetSeconds: editor.cameraOffset.seconds)
         let span = max(0.05, editor.cameraFileDuration - align.cameraSkip)
         let placed = TimelineLayout.clipFrame(
             start: align.cameraAt, span: span,
-            timeline: editor.duration, trackWidth: w)
+            timeline: editor.duration, trackWidth: view.fullWidth)
         return ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color.black.opacity(0.04))
             if editor.hasCamera {
-                if !editor.cameraThumbnails.isEmpty {
-                    HStack(spacing: 0) {
-                        ForEach(editor.cameraThumbnails.indices, id: \.self) { i in
-                            Image(decorative: editor.cameraThumbnails[i], scale: 1)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: max(6, placed.width / CGFloat(max(editor.cameraThumbnails.count, 1))),
-                                       height: 32)
-                                .clipped()
+                keepLane(view: view, height: 32) {
+                    if !editor.cameraThumbnails.isEmpty {
+                        HStack(spacing: 0) {
+                            ForEach(editor.cameraThumbnails.indices, id: \.self) { i in
+                                Image(decorative: editor.cameraThumbnails[i], scale: 1)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: max(6, placed.width / CGFloat(max(editor.cameraThumbnails.count, 1))),
+                                           height: 32)
+                                    .clipped()
+                            }
                         }
-                    }
-                    .frame(width: placed.width, height: 32)
-                    .offset(x: placed.x)
-                    .clipped()
-                } else {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Frame.accent.opacity(0.16))
-                        .overlay(Text("Camera").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.accent))
                         .frame(width: placed.width, height: 32)
                         .offset(x: placed.x)
+                    } else {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Frame.accent.opacity(0.16))
+                            .overlay(Text("Camera").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.accent))
+                            .frame(width: placed.width, height: 32)
+                            .offset(x: placed.x)
+                    }
                 }
             } else {
                 Text(editor.cameraClipStatus == .wantedButMissing
@@ -272,9 +315,9 @@ struct TimelineStrip: View {
                     .padding(.horizontal, 8)
             }
         }
-        .frame(width: w, height: 32)
+        .frame(width: view.trackWidth, height: 32)
         .onTapGesture(coordinateSpace: .local) { point in
-            editor.seekRaw(to: timeOnTrack(x: point.x, trackWidth: w), precise: true)
+            editor.seek(to: view.time(at: point.x))
         }
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
@@ -285,17 +328,20 @@ struct TimelineStrip: View {
     }
 
     private func audioLane(samples: [Float], tint: Color, delay: Double,
-                           span: Double, empty: String, width w: CGFloat) -> some View {
+                           span: Double, empty: String,
+                           view: TimelineLayout.KeepWindow) -> some View {
         let placed = TimelineLayout.clipFrame(
             start: delay, span: max(span, 0.05),
-            timeline: editor.duration, trackWidth: w)
+            timeline: editor.duration, trackWidth: view.fullWidth)
         return ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .fill(Color.black.opacity(0.04))
             if samples.contains(where: { $0 > 0.02 }) {
-                WaveformOverlay(samples: samples, color: tint.opacity(0.9))
-                    .frame(width: placed.width)
-                    .offset(x: placed.x)
+                keepLane(view: view, height: 28) {
+                    WaveformOverlay(samples: samples, color: tint.opacity(0.9))
+                        .frame(width: placed.width)
+                        .offset(x: placed.x)
+                }
             } else {
                 Text(empty)
                     .font(.system(size: 10, weight: .medium))
@@ -304,29 +350,31 @@ struct TimelineStrip: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .frame(width: w, height: 28)
+        .frame(width: view.trackWidth, height: 28)
         .clipped()
         .onTapGesture(coordinateSpace: .local) { point in
-            editor.seekRaw(to: timeOnTrack(x: point.x, trackWidth: w), precise: true)
+            editor.seek(to: view.time(at: point.x))
         }
     }
 
-    private func zoomLane(width w: CGFloat, pps: CGFloat) -> some View {
-        let hoverTime = hoverZoomX.map { timeOnTrack(x: $0, trackWidth: w) }
+    private func zoomLane(view: TimelineLayout.KeepWindow) -> some View {
+        let hoverTime = hoverZoomX.map { view.time(at: $0) }
         let hoverOverChip = hoverTime.map { t in
             editor.zooms.contains { ZoomSnap.covers(start: $0.start, duration: $0.duration, time: t) }
         } ?? false
         return ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .fill(Color.black.opacity(0.04))
-                .frame(width: w, height: 28)
-            ForEach(editor.zooms) { zoom in
-                zoomChip(zoom, pps: pps)
+                .frame(width: view.trackWidth, height: 28)
+            keepLane(view: view, height: 28) {
+                ForEach(editor.zooms.filter { view.intersects(start: $0.start, duration: $0.duration) }) { zoom in
+                    zoomChip(zoom, view: view)
+                }
             }
             if !isEditingZoom, !hoverOverChip, let hx = hoverZoomX {
                 Button {
                     let snapped = ZoomSnap.snap(
-                        timeOnTrack(x: hx, trackWidth: w),
+                        view.time(at: hx),
                         playhead: editor.currentTime,
                         timeline: editor.duration)
                     editor.addZoom(at: snapped)
@@ -341,19 +389,21 @@ struct TimelineStrip: View {
                 .position(x: hx, y: 14)
             }
         }
-        .frame(width: w, height: 28)
+        .frame(width: view.trackWidth, height: 28)
+        .clipped()
         .contentShape(Rectangle())
         .onContinuousHover { phase in
             switch phase {
             case .active(let p):
-                hoverZoomX = min(max(p.x, 0), w)
+                hoverZoomX = min(max(p.x, 0), view.trackWidth)
             case .ended:
                 hoverZoomX = nil
             }
         }
     }
 
-    private func zoomChip(_ zoom: ZoomSegment, pps: CGFloat) -> some View {
+    private func zoomChip(_ zoom: ZoomSegment, view: TimelineLayout.KeepWindow) -> some View {
+        let pps = view.pps
         let on = editor.selectedZoomID == zoom.id
         let width = max(44, zoom.duration * pps)
         return ZStack {
@@ -385,7 +435,7 @@ struct TimelineStrip: View {
             var z = zoom
             z.start = (zoomStartBase[zoom.id] ?? z.start) + Double(value.translation.width) / Double(pps)
             editor.update(z, rebuild: false)
-            showSnapGuide(for: z.start, pps: pps)
+            showSnapGuide(for: z.start, view: view)
         }.onEnded { _ in
             if var current = editor.zooms.first(where: { $0.id == zoom.id }) {
                 current.start = clampedZoomStart(
@@ -398,16 +448,17 @@ struct TimelineStrip: View {
         })
         .overlay(alignment: .leading) {
             Color.clear.frame(width: 11, height: 22).contentShape(Rectangle())
-                .highPriorityGesture(resize(zoom: zoom, pps: pps, leading: true))
+                .highPriorityGesture(resize(zoom: zoom, view: view, leading: true))
         }
         .overlay(alignment: .trailing) {
             Color.clear.frame(width: 11, height: 22).contentShape(Rectangle())
-                .highPriorityGesture(resize(zoom: zoom, pps: pps, leading: false))
+                .highPriorityGesture(resize(zoom: zoom, view: view, leading: false))
         }
         .help("Drag the middle to move. Drag either end to make the zoom longer.")
     }
 
-    private func resize(zoom: ZoomSegment, pps: CGFloat, leading: Bool) -> some Gesture {
+    private func resize(zoom: ZoomSegment, view: TimelineLayout.KeepWindow,
+                        leading: Bool) -> some Gesture {
         DragGesture(minimumDistance: 1).onChanged { value in
             if zoomStartBase[zoom.id] == nil {
                 zoomStartBase[zoom.id] = zoom.start
@@ -416,14 +467,14 @@ struct TimelineStrip: View {
             }
             let sized = ZoomTiming.resize(start: zoomStartBase[zoom.id] ?? zoom.start,
                                           duration: zoomDurationBase[zoom.id] ?? zoom.duration,
-                                          delta: Double(value.translation.width) / Double(pps),
+                                          delta: Double(value.translation.width) / Double(view.pps),
                                           leading: leading,
                                           timeline: editor.duration)
             var z = zoom
             z.start = sized.start
             z.duration = sized.duration
             editor.update(z, rebuild: false)
-            showSnapGuide(for: leading ? z.start : z.end, pps: pps)
+            showSnapGuide(for: leading ? z.start : z.end, view: view)
         }.onEnded { _ in
             if var current = editor.zooms.first(where: { $0.id == zoom.id }) {
                 current = snappedZoom(current, leading: leading)
@@ -435,9 +486,9 @@ struct TimelineStrip: View {
         }
     }
 
-    private func showSnapGuide(for time: Double, pps: CGFloat) {
+    private func showSnapGuide(for time: Double, view: TimelineLayout.KeepWindow) {
         if ZoomSnap.nearPlayhead(time, playhead: editor.currentTime) {
-            snapGuideX = CGFloat(editor.currentTime) * pps
+            snapGuideX = view.x(for: editor.currentTime)
         } else {
             snapGuideX = nil
         }
@@ -470,73 +521,32 @@ struct TimelineStrip: View {
 
 private struct FilmstripView: View, Equatable {
     let thumbnails: [CGImage]
-    let width: CGFloat
     let clipX: CGFloat
     let clipWidth: CGFloat
-    let duration: Double
-    let trimStart: Double
-    let trimEnd: Double
-    var onTrim: (TrimEdge, Double) -> Void
-    var onTrimEnd: () -> Void
 
     enum TrimEdge { case start, end }
 
     static func == (lhs: FilmstripView, rhs: FilmstripView) -> Bool {
-        lhs.width == rhs.width
-            && lhs.clipX == rhs.clipX
+        lhs.clipX == rhs.clipX
             && lhs.clipWidth == rhs.clipWidth
-            && lhs.duration == rhs.duration
-            && lhs.trimStart == rhs.trimStart
-            && lhs.trimEnd == rhs.trimEnd
             && lhs.thumbnails.count == rhs.thumbnails.count
             && lhs.thumbnails.first === rhs.thumbnails.first
     }
 
     var body: some View {
-        let pps = width / max(duration, 0.1)
-        return ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.black.opacity(0.04))
-            HStack(spacing: 0) {
-                ForEach(thumbnails.indices, id: \.self) { i in
-                    Image(decorative: thumbnails[i], scale: 1)
-                        .resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: max(8, clipWidth / CGFloat(max(thumbnails.count, 1))), height: 52)
-                        .clipped()
-                }
+        HStack(spacing: 0) {
+            ForEach(thumbnails.indices, id: \.self) { i in
+                Image(decorative: thumbnails[i], scale: 1)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: max(8, clipWidth / CGFloat(max(thumbnails.count, 1))), height: 52)
+                    .clipped()
             }
-            .frame(width: clipWidth, height: 52, alignment: .leading)
-            .offset(x: clipX)
-            .clipped()
-            Rectangle().fill(Color.black.opacity(0.28))
-                .frame(width: trimStart * pps)
-            Rectangle().fill(Color.black.opacity(0.28))
-                .frame(width: max(0, width - trimEnd * pps))
-                .offset(x: trimEnd * pps)
-
-            trimHandle(pps: pps, edge: .start)
-            trimHandle(pps: pps, edge: .end)
         }
-        .frame(width: width, height: 52)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Frame.hairline))
-        .contentShape(Rectangle())
-    }
-
-    private func trimHandle(pps: CGFloat, edge: TrimEdge) -> some View {
-        let x = (edge == .start ? trimStart : trimEnd) * pps
-        return RoundedRectangle(cornerRadius: 2, style: .continuous)
-            .fill(Color.white)
-            .overlay(RoundedRectangle(cornerRadius: 2).strokeBorder(Color.black.opacity(0.2)))
-            .frame(width: 7, height: 52)
-            .offset(x: x - 3.5)
-            .highPriorityGesture(DragGesture(minimumDistance: 1).onChanged { value in
-                onTrim(edge, Double(value.translation.width) / Double(pps))
-            }.onEnded { _ in
-                onTrimEnd()
-            })
+        .frame(width: clipWidth, height: 52, alignment: .leading)
+        .offset(x: clipX)
+        .clipped()
     }
 }
 
