@@ -223,14 +223,16 @@ struct EditorView: View {
                 })
                 .contextMenu {
                     Button("Camera") { addScene(.camera) }
-                    Button("Camera + Device") { addScene(.both) }
-                    Button("Device") { addScene(.device) }
+                    if editor.hasPhone {
+                        Button("Camera + Device") { addScene(.both) }
+                        Button("Device") { addScene(.device) }
+                    }
                 }
                 .onTapGesture { } // keep context menu
             }
             .frame(height: 64)
             HStack {
-                ForEach(SceneKind.allCases) { kind in
+                ForEach(SceneKind.allCases.filter { editor.hasPhone || $0 == .camera }) { kind in
                     Button { addScene(kind) } label: {
                         Text(kind.rawValue)
                             .font(.system(size: 11, weight: .semibold))
@@ -695,9 +697,12 @@ private struct DualReviewCanvas: View {
                 return next
             }()
             let kind = layout.scene(at: editor.currentTime)
-            let showPhone = kind != .camera
+            let showPhone = kind != .camera && editor.hasPhone && layout.hasPhoneSource
             let showCamera = kind != .device && engine.cameraEnabled && editor.hasCamera
-            let isSplit = engine.presenterLayout == .split
+            let dest = layout.soloCentered(showPhone: showPhone, showCamera: showCamera)
+            let appear = ExportLayout.appearanceProgress(at: editor.currentTime, layout: layout)
+            let placed = layout.blended(toward: dest, progress: appear)
+            let isSplit = placed.presenterLayout == .split
             let t = editor.currentTime
             let selected = editor.selectedZoom
             let aiming = selected != nil && !editor.isPlaying
@@ -712,7 +717,7 @@ private struct DualReviewCanvas: View {
                 ? presented.width / presented.height
                 : max(engine.phoneAspect, 0.3)
             let screen = CanvasDraw.phoneScreenRect(
-                canvas: size, layout: layout, phoneAspect: phoneAspect)
+                canvas: size, layout: placed, phoneAspect: phoneAspect)
             let canvasAim = CanvasDraw.canvasUnit(
                 fromPhone: phoneCenter, screen: screen, canvas: size)
             ZStack {
@@ -726,7 +731,7 @@ private struct DualReviewCanvas: View {
                                        zoomAnchor: .center, aiming: aiming)
                         }
                         if showCamera {
-                            cameraLayer(in: size, layout: layout)
+                            cameraLayer(in: size, layout: placed, lockedCenter: !showPhone)
                         }
                     }
                     .frame(width: size.width, height: size.height)
@@ -739,7 +744,7 @@ private struct DualReviewCanvas: View {
                                    aiming: aiming)
                     }
                     if showCamera {
-                        cameraLayer(in: size, layout: layout)
+                        cameraLayer(in: size, layout: placed, lockedCenter: !showPhone)
                     }
                 }
             }
@@ -789,16 +794,16 @@ private struct DualReviewCanvas: View {
         .position(x: screen.midX, y: screen.midY)
     }
 
-    private func cameraLayer(in size: CGSize, layout: ExportLayout) -> some View {
-        let frac = min(max(engine.bubbleFraction, ExportLayout.bubbleMin), ExportLayout.bubbleMax)
+    private func cameraLayer(in size: CGSize, layout: ExportLayout, lockedCenter: Bool) -> some View {
+        let frac = min(max(layout.bubbleFraction, ExportLayout.bubbleMin), ExportLayout.bubbleMax)
         let aspect: CGFloat = engine.cameraShape == .rectangle ? 4 / 5 : 1
         let (w, h, center, corner): (CGFloat, CGFloat, CGPoint, CGFloat) = {
-            switch engine.presenterLayout {
+            switch layout.presenterLayout {
             case .floating:
                 let s = frac * min(size.width, size.height)
                 let cr: CGFloat = engine.cameraShape == .circle ? 0.5
                     : (engine.cameraShape == .square ? 0.18 : 0.14)
-                return (s * aspect, s, engine.bubbleCenter, cr)
+                return (s * aspect, s, layout.bubbleCenter, cr)
             case .split:
                 let zone = ExportLayout.splitZones(canvas: size, layout: layout).camera
                 let fit = min(zone.width / aspect, zone.height) * 0.92
@@ -825,7 +830,9 @@ private struct DualReviewCanvas: View {
                     .strokeBorder(highlighted ? Frame.accent : Color.white.opacity(0.35),
                                   lineWidth: cameraSelected ? 2.5 : 1.5)
             }
-            .overlay { resizeHandles(canvas: size, width: w, height: h) }
+            .overlay { resizeHandles(canvas: size, width: w, height: h,
+                                     floating: layout.presenterLayout == .floating,
+                                     lockedCenter: lockedCenter) }
             .background {
                 RoundedRectangle(cornerRadius: min(w, h) * corner, style: .continuous)
                     .fill(Color.black.opacity(0.001))
@@ -842,7 +849,7 @@ private struct DualReviewCanvas: View {
                 DragGesture(minimumDistance: 2, coordinateSpace: .named("reviewCanvas"))
                     .onChanged { value in
                         cameraSelected = true
-                        guard engine.presenterLayout == .floating else { return }
+                        guard !lockedCenter, layout.presenterLayout == .floating else { return }
                         engine.bubbleCenter = CGPoint(
                             x: min(max(value.location.x / max(size.width, 1), 0.08), 0.92),
                             y: min(max(value.location.y / max(size.height, 1), 0.08), 0.92))
@@ -853,13 +860,14 @@ private struct DualReviewCanvas: View {
                     }
             )
             .onTapGesture { cameraSelected = true }
-            .help(engine.presenterLayout == .floating ? "Drag to move the camera" : "Camera")
+            .help(layout.presenterLayout == .floating && !lockedCenter ? "Drag to move the camera" : "Camera")
             .position(x: center.x * size.width, y: center.y * size.height)
     }
 
     @ViewBuilder
-    private func resizeHandles(canvas: CGSize, width: CGFloat, height: CGFloat) -> some View {
-        if cameraSelected, engine.presenterLayout == .floating {
+    private func resizeHandles(canvas: CGSize, width: CGFloat, height: CGFloat,
+                               floating: Bool, lockedCenter: Bool) -> some View {
+        if cameraSelected, floating, !lockedCenter {
             let corners: [Alignment] = [.topLeading, .topTrailing, .bottomLeading, .bottomTrailing]
             ForEach(Array(corners.enumerated()), id: \.offset) { _, align in
                 handleDot

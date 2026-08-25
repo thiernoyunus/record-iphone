@@ -322,6 +322,28 @@ struct TakeIntentDoc: Codable, Equatable {
     }
 }
 
+enum RecordingSourceRules {
+    static func hasPhoneSource(phoneURL: URL, phoneSegments: [URL]) -> Bool {
+        phoneSegments.contains { $0.standardizedFileURL == phoneURL.standardizedFileURL }
+    }
+}
+
+enum RecordingFinishPolicy {
+    static func expectedFinishes(hasPhoneSource: Bool, phoneActive: Bool, cameraActive: Bool) -> Int {
+        (hasPhoneSource && phoneActive ? 1 : 0) + (cameraActive ? 1 : 0)
+    }
+}
+
+enum ProjectMediaSelection {
+    static func candidates(in dir: URL) -> [URL] {
+        [
+            dir.appendingPathComponent("phone.mov"),
+            dir.appendingPathComponent("camera.mov"),
+            dir.appendingPathComponent("camera.keep.mov"),
+        ]
+    }
+}
+
 enum EditorLogicTests {
     static func run() -> (Bool, String) {
         var lines: [String] = []
@@ -330,6 +352,38 @@ enum EditorLogicTests {
             if cond { lines.append("OK \(name)") }
             else { lines.append("FAIL \(name)"); failed += 1 }
         }
+
+        let splitLook = ExportLayout(
+            bubbleCenter: CGPoint(x: 0.82, y: 0.78), bubbleFraction: 0.22,
+            canvas: CGSize(width: 1920, height: 1080), background: .snow, showBezel: false,
+            presenterLayout: .split, deviceOnLeft: true)
+        let phoneOnly = splitLook.soloCentered(showPhone: true, showCamera: false)
+        expect("phone-only leaves the side-by-side layout and sits in the middle",
+               phoneOnly.presenterLayout == .floating)
+        let both = splitLook.soloCentered(showPhone: true, showCamera: true)
+        expect("phone plus camera keep the left/right layout",
+               both.presenterLayout == .split && both.deviceOnLeft)
+        let camOnly = splitLook.soloCentered(showPhone: false, showCamera: true)
+        expect("camera-only sits in the middle of the canvas",
+               camOnly.presenterLayout == .floating
+               && abs(camOnly.bubbleCenter.x - 0.5) < 0.001
+               && abs(camOnly.bubbleCenter.y - 0.5) < 0.001)
+        var noPhone = splitLook
+        noPhone.hasPhoneSource = false
+        noPhone.cameraEnabled = true
+        expect("a take with no phone defaults to the camera scene",
+               noPhone.scene(at: 1) == .camera)
+        expect("scene appearance is 0 at the cut and 1 after a beat",
+               ExportLayout.appearanceProgress(at: 2.0, layout: {
+                   var l = splitLook
+                   l.scenes = [SceneClip(kind: .camera, start: 2, duration: 4)]
+                   return l
+               }()) < 0.01
+               && ExportLayout.appearanceProgress(at: 2.5, layout: {
+                   var l = splitLook
+                   l.scenes = [SceneClip(kind: .camera, start: 2, duration: 4)]
+                   return l
+               }()) > 0.99)
 
         expect("wanted + missing file is a lost camera clip",
                CameraClipStatus.resolve(wantedCamera: true, cameraFileExists: false, hasVideoTrack: false) == .wantedButMissing)
@@ -343,6 +397,20 @@ enum EditorLogicTests {
                CameraClipStatus.wantedButMissing.layoutMessage.contains("didn't save"))
         expect("phone-only message does not claim a failed save",
                !CameraClipStatus.phoneOnly.layoutMessage.contains("didn't save"))
+        let takeDir = URL(fileURLWithPath: "/tmp/record-iphone-take")
+        let phoneURL = takeDir.appendingPathComponent("phone.mov")
+        let cameraURL = takeDir.appendingPathComponent("camera.mov")
+        expect("phone-only source stays a phone source",
+               RecordingSourceRules.hasPhoneSource(phoneURL: phoneURL, phoneSegments: [phoneURL]))
+        expect("camera-only source is not mistaken for a phone source",
+               !RecordingSourceRules.hasPhoneSource(phoneURL: cameraURL, phoneSegments: [phoneURL]))
+        expect("camera-only finish counts only the camera writer",
+               RecordingFinishPolicy.expectedFinishes(hasPhoneSource: false, phoneActive: true, cameraActive: true) == 1)
+        expect("phone and camera finish count both writers",
+               RecordingFinishPolicy.expectedFinishes(hasPhoneSource: true, phoneActive: true, cameraActive: true) == 2)
+        expect("thumbnail candidates prefer phone then camera snapshot",
+               ProjectMediaSelection.candidates(in: takeDir).map(\.lastPathComponent)
+                == ["phone.mov", "camera.mov", "camera.keep.mov"])
 
         let stretched = SceneTiming.resize(start: 2, duration: 4, delta: 6, leading: false, timeline: 26)
         expect("device scene can stretch longer", abs(stretched.duration - 10) < 0.001 && abs(stretched.start - 2) < 0.001)

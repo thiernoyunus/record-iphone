@@ -124,6 +124,8 @@ final class CaptureEngine: NSObject, ObservableObject {
     @Published var showBezel = false
     @Published var phoneScale: CGFloat = ExportLayout.phoneHeightFraction
     @Published var cameraEnabled = false
+    /// False when this take / preview has no iPhone picture.
+    @Published var hasPhoneSource = true
     @Published var cameraShape: CameraShape = .circle
     @Published var ringRGB: [CGFloat] = [1, 1, 1]
     @Published var frameStyle: DeviceFrameStyle = .none
@@ -154,6 +156,7 @@ final class CaptureEngine: NSObject, ObservableObject {
         case none
         case cable
         case wireless
+        case cameraOnly
     }
     @Published var connectionKind: ConnectionKind = .none
     @Published var showConnectSheet = false
@@ -394,7 +397,7 @@ final class CaptureEngine: NSObject, ObservableObject {
             missingDeviceStrikes = 0
         }
         if selectedPhone == nil, let first = found.first, case .idle = phase, editor == nil,
-           connectionKind != .wireless, !showHome {
+           connectionKind != .wireless, connectionKind != .cameraOnly, !showHome {
             connectionKind = .cable
             select(phone: first)
         }
@@ -495,6 +498,7 @@ final class CaptureEngine: NSObject, ObservableObject {
     var hasLiveDevice: Bool {
         switch connectionKind {
         case .wireless: return airplay.link.holdsPreview || airplay.isConnected
+        case .cameraOnly: return false
         case .cable, .none: return selectedPhone != nil && phoneReady
         }
     }
@@ -530,12 +534,14 @@ final class CaptureEngine: NSObject, ObservableObject {
                     self.audioPreview = nil
                     self.selectedPhone = nil
                     self.connectionKind = .wireless
+                    self.hasPhoneSource = true
                     self.airplay.start()
                 }
             }
             return
         }
         connectionKind = .wireless
+        hasPhoneSource = true
         airplay.start()
     }
 
@@ -552,6 +558,7 @@ final class CaptureEngine: NSObject, ObservableObject {
         showHome = false
         airplay.stop()
         connectionKind = .cable
+        hasPhoneSource = true
         showConnectSheet = false
         refreshAVDevices()
         reconnectIfNeeded()
@@ -576,6 +583,7 @@ final class CaptureEngine: NSObject, ObservableObject {
         guard case .idle = phase, editor == nil else { return }
         if connectionKind == .wireless { airplay.stop() }
         connectionKind = .cable
+        hasPhoneSource = true
 
         let same = selectedPhone?.uniqueID == phone.uniqueID
         switch PhoneConnectPolicy.decide(
@@ -1068,6 +1076,7 @@ final class CaptureEngine: NSObject, ObservableObject {
         showHome = true
         setupOpen = false
         phonePreviewAttached = false
+        if connectionKind == .cameraOnly { connectionKind = .none }
         stopMacCamera()
         resetMixToDefaults()
     }
@@ -1087,19 +1096,53 @@ final class CaptureEngine: NSObject, ObservableObject {
         beginArming(startPhoneImmediately: false)
     }
 
+    var canRecord: Bool {
+        if editor != nil { return false }
+        if connectionKind == .cameraOnly {
+            return cameraEnabled && cameraSessionRunning
+        }
+        return phoneReady
+    }
+
     func startRecording() {
         showHome = false
         if case .arming = phase {
             finishArmingPhone()
             return
         }
-        guard case .idle = phase, phoneReady, editor == nil else { return }
+        guard case .idle = phase, editor == nil else { return }
+        if connectionKind == .cameraOnly {
+            guard canRecord else { return }
+            beginArmingCameraOnly()
+            return
+        }
+        guard phoneReady else { return }
         beginArming(startPhoneImmediately: true)
+    }
+
+    func startCameraOnly() {
+        showHome = false
+        guard case .idle = phase, editor == nil else { return }
+        if connectionKind == .wireless { airplay.stop() }
+        selectedPhone = nil
+        phoneReady = false
+        connectionKind = .cameraOnly
+        hasPhoneSource = false
+        cameraEnabled = true
+        showConnectSheet = false
+        presenterLayout = .floating
+        bubbleCenter = CGPoint(x: 0.5, y: 0.5)
+        if soundMode == .device || soundMode == .off { setSoundMode(.mic) }
+        Task { await ensureCameraPermissionAndStart() }
     }
 
     private func beginArming(startPhoneImmediately: Bool) {
         if connectionKind == .wireless {
             startAirPlayRecording(startPhoneImmediately: startPhoneImmediately)
+            return
+        }
+        if connectionKind == .cameraOnly {
+            beginArmingCameraOnly()
             return
         }
         guard selectedPhone != nil else { return }
@@ -1163,6 +1206,70 @@ final class CaptureEngine: NSObject, ObservableObject {
         // that is the crash after Stop / simulate-stop.
         detachFrameTapForRecording { [weak self] in
             self?.beginMovieWriters(generation: gen, startPhoneImmediately: startPhoneImmediately)
+        }
+    }
+
+    private func beginArmingCameraOnly() {
+        guard cameraEnabled else {
+            errorMessage = "Turn the Mac camera on to record without a phone."
+            return
+        }
+        guard cameraSessionRunning else {
+            errorMessage = "Camera isn't ready. Check camera permissions in System Settings."
+            return
+        }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        let dir = FileManager.default
+            .urls(for: .moviesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Record iPhone/\(fmt.string(from: .now))", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            errorMessage = "Couldn't create the recording folder: \(error.localizedDescription)"
+            return
+        }
+
+        startTimes = [:]
+        finishedURLs = []
+        expectedFinishes = 1
+        phoneStartedOK = false
+        cameraStartedOK = false
+        cameraWriterClosed = false
+        cancelArming = false
+        discardedLastTake = false
+        editorOpening = false
+        openingStatus = nil
+        resetMixToDefaults()
+        phonePartNumber = 1
+        let cam = dir.appendingPathComponent("camera.mov")
+        cameraFileURL = cam
+        phoneFileURL = cam
+        recordGeneration += 1
+        let gen = recordGeneration
+        writeTakeIntent(in: dir)
+
+        phase = .arming
+        applyMonitorVolume()
+        detachFrameTapForRecording { [weak self] in
+            self?.beginCameraOnlyWriter(generation: gen)
+        }
+    }
+
+    private func beginCameraOnlyWriter(generation: Int) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.recordGeneration == generation else { return }
+            guard let camURL = self.cameraFileURL else { return }
+            if !self.cameraSession.isRunning { self.cameraSession.startRunning() }
+            if self.cameraOutput.isRecording {
+                DispatchQueue.main.async {
+                    self.abortRecording(reason: "Camera is already recording. Press Stop, then try again.")
+                }
+                return
+            }
+            for c in self.cameraOutput.connections { c.isEnabled = true }
+            self.cameraOutput.startRecording(to: camURL, recordingDelegate: self)
         }
     }
 
@@ -1439,7 +1546,10 @@ final class CaptureEngine: NSObject, ObservableObject {
         airplay.mutePresentation = true
         let phoneWas = phoneIsWriting || phoneStartedOK
         let cameraWas = cameraOutput.isRecording || cameraStartedOK
-        expectedFinishes = (phoneWas ? 1 : 0) + (cameraWas ? 1 : 0)
+        expectedFinishes = RecordingFinishPolicy.expectedFinishes(
+            hasPhoneSource: hasPhoneSource,
+            phoneActive: phoneWas,
+            cameraActive: cameraWas)
         if expectedFinishes == 0 {
             phase = .idle
             freezeLivePreview = false
@@ -1451,9 +1561,11 @@ final class CaptureEngine: NSObject, ObservableObject {
         // Copy camera.mov off the main thread. Stopping writers also
         // hops to the session queue so Stop cannot freeze the window.
         let phoneIsRec = phoneOutput.isRecording
-        let sampleWas = phoneUsesSampleWriter && (phoneSamples.isWriting || phoneStartedOK)
+        let sampleWas = hasPhoneSource && phoneUsesSampleWriter
+            && (phoneSamples.isWriting || phoneStartedOK)
         let cameraIsRec = cameraOutput.isRecording
-        if !phoneIsRec, !sampleWas, phoneStartedOK, let url = phoneFileURL, !finishedURLs.contains(url) {
+        if !phoneIsRec, !sampleWas, hasPhoneSource, phoneStartedOK,
+           let url = phoneFileURL, !finishedURLs.contains(url) {
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             if size > 1024 { finishedURLs.append(url) }
         }
@@ -1530,9 +1642,11 @@ final class CaptureEngine: NSObject, ObservableObject {
             beginFinishing()
             return
         }
-        if phoneStartedOK {
+        let sourceStarted = phoneStartedOK
+            || (connectionKind == .cameraOnly && cameraStartedOK)
+        if sourceStarted {
             phase = .recording(startedAt: .now)
-            startPhoneWriterWatch()
+            if phoneStartedOK { startPhoneWriterWatch() }
         }
     }
 
@@ -1647,7 +1761,8 @@ final class CaptureEngine: NSObject, ObservableObject {
             cameraLeads: cameraLeads,
             overlapArrangement: overlapArrangement,
             splitBalance: splitBalance,
-            splitGap: splitGap)
+            splitGap: splitGap,
+            hasPhoneSource: hasPhoneSource)
     }
 
     func cancelRecording() {
@@ -1661,7 +1776,7 @@ final class CaptureEngine: NSObject, ObservableObject {
 
     func restartRecording() {
         discardedLastTake = true
-        let wasReady = selectedPhone != nil && phoneReady
+        let wasReady = canRecord
         abortRecording(reason: "")
         errorMessage = nil
         if let dir = phoneFileURL?.deletingLastPathComponent() {
@@ -1911,10 +2026,20 @@ final class CaptureEngine: NSObject, ObservableObject {
                 Self.preserveCameraCopy(cameraURL: camToKeep, phoneURL: phoneToKeep)
             }
             do {
-                let playPhone = try await Exporter.preparePhonePlayback(in: dir)
+                let phoneSegments = PhoneSegments.urls(in: dir)
+                let cameraOnly = !RecordingSourceRules.hasPhoneSource(
+                    phoneURL: phone, phoneSegments: phoneSegments)
                 var playCam: URL?
-                if camera.standardizedFileURL != phone.standardizedFileURL {
+                if !cameraOnly, camera.standardizedFileURL != phone.standardizedFileURL {
                     playCam = try? await Exporter.preparePlaybackCopy(camera)
+                } else if cameraOnly {
+                    playCam = try? await Exporter.preparePlaybackCopy(camera)
+                }
+                let playPhone: URL
+                if cameraOnly, let playCam {
+                    playPhone = playCam
+                } else {
+                    playPhone = try await Exporter.preparePhonePlayback(in: dir)
                 }
                 let readyCam = playCam ?? playPhone
                 await MainActor.run { [weak self] in
@@ -2210,7 +2335,10 @@ final class CaptureEngine: NSObject, ObservableObject {
             let isDir = (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             guard isDir else { continue }
             let phone = dir.appendingPathComponent("phone.mov")
-            guard FileManager.default.fileExists(atPath: phone.path) else { continue }
+            let camera = dir.appendingPathComponent("camera.mov")
+            let hasPhone = FileManager.default.fileExists(atPath: phone.path)
+            let hasCamera = FileManager.default.fileExists(atPath: camera.path)
+            guard hasPhone || hasCamera else { continue }
             let date = (try? dir.resourceValues(forKeys: [.contentModificationDateKey])
                 .contentModificationDate) ?? .distantPast
             // Exports may be "Recording.mp4", "Recording 2.mp4", … — any mp4 counts.
@@ -2240,28 +2368,45 @@ final class CaptureEngine: NSObject, ObservableObject {
            FileManager.default.fileExists(atPath: keep.path) {
             cameraURL = keep
         }
-        guard FileManager.default.fileExists(atPath: phoneURL.path) else {
-            errorMessage = "Can't find the phone recording in that folder."
-            return
-        }
         let phoneSize = (try? phoneURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        if phoneSize < 20_000 {
-            errorMessage = "That take didn’t finish saving, so it can’t be opened. Record again and press Stop."
-            return
+        let phoneExists = FileManager.default.fileExists(atPath: phoneURL.path) && phoneSize > 1024
+        let cameraSize = (try? cameraURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let cameraExists = FileManager.default.fileExists(atPath: cameraURL.path) && cameraSize > 1024
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let phoneOK: Bool
+            if phoneExists {
+                phoneOK = await Exporter.movieHasUsableVideo(phoneURL)
+            } else {
+                phoneOK = false
+            }
+            let cameraOK: Bool
+            if cameraExists {
+                cameraOK = await Exporter.movieHasUsableVideo(cameraURL)
+            } else {
+                cameraOK = false
+            }
+            guard case .idle = self.phase, self.editor == nil, !self.editorOpening else { return }
+            guard phoneOK || cameraOK else {
+                self.errorMessage = "Can't find a usable phone or camera recording in that folder."
+                return
+            }
+            if !phoneOK {
+                self.presentEditor(phone: cameraURL, camera: cameraURL, offset: .zero, pauseLive: false)
+                return
+            }
+            // Restore the measured phone/camera start offset saved at record time —
+            // without it, reopened projects play the camera out of sync.
+            struct OffsetPeek: Codable { var cameraOffsetSeconds: Double? }
+            var offset = CMTime.zero
+            if let data = try? Data(contentsOf: project.dir.appendingPathComponent("project.json")),
+               let peek = try? JSONDecoder().decode(OffsetPeek.self, from: data),
+               let seconds = peek.cameraOffsetSeconds {
+                offset = CMTime(seconds: seconds, preferredTimescale: 600)
+            }
+            self.presentEditor(phone: phoneURL, camera: cameraOK ? cameraURL : phoneURL,
+                               offset: offset, pauseLive: false)
         }
-        let camExists = FileManager.default.fileExists(atPath: cameraURL.path)
-            && ((try? cameraURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 1024
-        // Restore the measured phone/camera start offset saved at record time —
-        // without it, reopened projects play the camera out of sync.
-        struct OffsetPeek: Codable { var cameraOffsetSeconds: Double? }
-        var offset = CMTime.zero
-        if let data = try? Data(contentsOf: project.dir.appendingPathComponent("project.json")),
-           let peek = try? JSONDecoder().decode(OffsetPeek.self, from: data),
-           let seconds = peek.cameraOffsetSeconds {
-            offset = CMTime(seconds: seconds, preferredTimescale: 600)
-        }
-        presentEditor(phone: phoneURL, camera: camExists ? cameraURL : phoneURL,
-                      offset: offset, pauseLive: false)
     }
 
     /// Moves a recording folder to the Trash (recoverable, never a hard delete).
