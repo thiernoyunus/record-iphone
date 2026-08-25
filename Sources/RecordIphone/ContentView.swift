@@ -1318,9 +1318,16 @@ struct ProjectThumb: View {
         .frame(width: width, height: height)
         .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
         .task {
-            let phone = dir.appendingPathComponent("phone.mov")
-            let camera = dir.appendingPathComponent("camera.mov")
-            let url = FileManager.default.fileExists(atPath: phone.path) ? phone : camera
+            var url: URL?
+            for candidate in ProjectMediaSelection.candidates(in: dir) {
+                let size = (try? candidate.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                guard FileManager.default.fileExists(atPath: candidate.path), size > 1024 else { continue }
+                if await Exporter.movieHasUsableVideo(candidate) {
+                    url = candidate
+                    break
+                }
+            }
+            guard let url else { return }
             if let cached = Self.cache.object(forKey: url as NSURL) {
                 image = cached
                 return

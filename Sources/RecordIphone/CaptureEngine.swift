@@ -1233,7 +1233,7 @@ final class CaptureEngine: NSObject, ObservableObject {
         startTimes = [:]
         finishedURLs = []
         expectedFinishes = 1
-        phoneStartedOK = true
+        phoneStartedOK = false
         cameraStartedOK = false
         cameraWriterClosed = false
         cancelArming = false
@@ -1546,7 +1546,10 @@ final class CaptureEngine: NSObject, ObservableObject {
         airplay.mutePresentation = true
         let phoneWas = phoneIsWriting || phoneStartedOK
         let cameraWas = cameraOutput.isRecording || cameraStartedOK
-        expectedFinishes = (phoneWas ? 1 : 0) + (cameraWas ? 1 : 0)
+        expectedFinishes = RecordingFinishPolicy.expectedFinishes(
+            hasPhoneSource: hasPhoneSource,
+            phoneActive: phoneWas,
+            cameraActive: cameraWas)
         if expectedFinishes == 0 {
             phase = .idle
             freezeLivePreview = false
@@ -1558,9 +1561,11 @@ final class CaptureEngine: NSObject, ObservableObject {
         // Copy camera.mov off the main thread. Stopping writers also
         // hops to the session queue so Stop cannot freeze the window.
         let phoneIsRec = phoneOutput.isRecording
-        let sampleWas = phoneUsesSampleWriter && (phoneSamples.isWriting || phoneStartedOK)
+        let sampleWas = hasPhoneSource && phoneUsesSampleWriter
+            && (phoneSamples.isWriting || phoneStartedOK)
         let cameraIsRec = cameraOutput.isRecording
-        if !phoneIsRec, !sampleWas, phoneStartedOK, let url = phoneFileURL, !finishedURLs.contains(url) {
+        if !phoneIsRec, !sampleWas, hasPhoneSource, phoneStartedOK,
+           let url = phoneFileURL, !finishedURLs.contains(url) {
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             if size > 1024 { finishedURLs.append(url) }
         }
@@ -1637,9 +1642,11 @@ final class CaptureEngine: NSObject, ObservableObject {
             beginFinishing()
             return
         }
-        if phoneStartedOK {
+        let sourceStarted = phoneStartedOK
+            || (connectionKind == .cameraOnly && cameraStartedOK)
+        if sourceStarted {
             phase = .recording(startedAt: .now)
-            startPhoneWriterWatch()
+            if phoneStartedOK { startPhoneWriterWatch() }
         }
     }
 
@@ -2019,8 +2026,9 @@ final class CaptureEngine: NSObject, ObservableObject {
                 Self.preserveCameraCopy(cameraURL: camToKeep, phoneURL: phoneToKeep)
             }
             do {
-                let cameraOnly = camera.standardizedFileURL == phone.standardizedFileURL
-                    || PhoneSegments.urls(in: dir).isEmpty
+                let phoneSegments = PhoneSegments.urls(in: dir)
+                let cameraOnly = !RecordingSourceRules.hasPhoneSource(
+                    phoneURL: phone, phoneSegments: phoneSegments)
                 var playCam: URL?
                 if !cameraOnly, camera.standardizedFileURL != phone.standardizedFileURL {
                     playCam = try? await Exporter.preparePlaybackCopy(camera)
@@ -2361,28 +2369,44 @@ final class CaptureEngine: NSObject, ObservableObject {
             cameraURL = keep
         }
         let phoneSize = (try? phoneURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        let camExists = FileManager.default.fileExists(atPath: cameraURL.path)
-            && ((try? cameraURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 1024
-        let phoneOK = FileManager.default.fileExists(atPath: phoneURL.path) && phoneSize >= 20_000
-        if !phoneOK, !camExists {
-            errorMessage = "Can't find a phone or camera recording in that folder."
-            return
+        let phoneExists = FileManager.default.fileExists(atPath: phoneURL.path) && phoneSize > 1024
+        let cameraSize = (try? cameraURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let cameraExists = FileManager.default.fileExists(atPath: cameraURL.path) && cameraSize > 1024
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let phoneOK: Bool
+            if phoneExists {
+                phoneOK = await Exporter.movieHasUsableVideo(phoneURL)
+            } else {
+                phoneOK = false
+            }
+            let cameraOK: Bool
+            if cameraExists {
+                cameraOK = await Exporter.movieHasUsableVideo(cameraURL)
+            } else {
+                cameraOK = false
+            }
+            guard case .idle = self.phase, self.editor == nil, !self.editorOpening else { return }
+            guard phoneOK || cameraOK else {
+                self.errorMessage = "Can't find a usable phone or camera recording in that folder."
+                return
+            }
+            if !phoneOK {
+                self.presentEditor(phone: cameraURL, camera: cameraURL, offset: .zero, pauseLive: false)
+                return
+            }
+            // Restore the measured phone/camera start offset saved at record time —
+            // without it, reopened projects play the camera out of sync.
+            struct OffsetPeek: Codable { var cameraOffsetSeconds: Double? }
+            var offset = CMTime.zero
+            if let data = try? Data(contentsOf: project.dir.appendingPathComponent("project.json")),
+               let peek = try? JSONDecoder().decode(OffsetPeek.self, from: data),
+               let seconds = peek.cameraOffsetSeconds {
+                offset = CMTime(seconds: seconds, preferredTimescale: 600)
+            }
+            self.presentEditor(phone: phoneURL, camera: cameraOK ? cameraURL : phoneURL,
+                               offset: offset, pauseLive: false)
         }
-        if !phoneOK, camExists {
-            presentEditor(phone: cameraURL, camera: cameraURL, offset: .zero, pauseLive: false)
-            return
-        }
-        // Restore the measured phone/camera start offset saved at record time —
-        // without it, reopened projects play the camera out of sync.
-        struct OffsetPeek: Codable { var cameraOffsetSeconds: Double? }
-        var offset = CMTime.zero
-        if let data = try? Data(contentsOf: project.dir.appendingPathComponent("project.json")),
-           let peek = try? JSONDecoder().decode(OffsetPeek.self, from: data),
-           let seconds = peek.cameraOffsetSeconds {
-            offset = CMTime(seconds: seconds, preferredTimescale: 600)
-        }
-        presentEditor(phone: phoneURL, camera: camExists ? cameraURL : phoneURL,
-                      offset: offset, pauseLive: false)
     }
 
     /// Moves a recording folder to the Trash (recoverable, never a hard delete).

@@ -322,6 +322,28 @@ struct TakeIntentDoc: Codable, Equatable {
     }
 }
 
+enum RecordingSourceRules {
+    static func hasPhoneSource(phoneURL: URL, phoneSegments: [URL]) -> Bool {
+        phoneSegments.contains { $0.standardizedFileURL == phoneURL.standardizedFileURL }
+    }
+}
+
+enum RecordingFinishPolicy {
+    static func expectedFinishes(hasPhoneSource: Bool, phoneActive: Bool, cameraActive: Bool) -> Int {
+        (hasPhoneSource && phoneActive ? 1 : 0) + (cameraActive ? 1 : 0)
+    }
+}
+
+enum ProjectMediaSelection {
+    static func candidates(in dir: URL) -> [URL] {
+        [
+            dir.appendingPathComponent("phone.mov"),
+            dir.appendingPathComponent("camera.mov"),
+            dir.appendingPathComponent("camera.keep.mov"),
+        ]
+    }
+}
+
 enum EditorLogicTests {
     static func run() -> (Bool, String) {
         var lines: [String] = []
@@ -375,6 +397,20 @@ enum EditorLogicTests {
                CameraClipStatus.wantedButMissing.layoutMessage.contains("didn't save"))
         expect("phone-only message does not claim a failed save",
                !CameraClipStatus.phoneOnly.layoutMessage.contains("didn't save"))
+        let takeDir = URL(fileURLWithPath: "/tmp/record-iphone-take")
+        let phoneURL = takeDir.appendingPathComponent("phone.mov")
+        let cameraURL = takeDir.appendingPathComponent("camera.mov")
+        expect("phone-only source stays a phone source",
+               RecordingSourceRules.hasPhoneSource(phoneURL: phoneURL, phoneSegments: [phoneURL]))
+        expect("camera-only source is not mistaken for a phone source",
+               !RecordingSourceRules.hasPhoneSource(phoneURL: cameraURL, phoneSegments: [phoneURL]))
+        expect("camera-only finish counts only the camera writer",
+               RecordingFinishPolicy.expectedFinishes(hasPhoneSource: false, phoneActive: true, cameraActive: true) == 1)
+        expect("phone and camera finish count both writers",
+               RecordingFinishPolicy.expectedFinishes(hasPhoneSource: true, phoneActive: true, cameraActive: true) == 2)
+        expect("thumbnail candidates prefer phone then camera snapshot",
+               ProjectMediaSelection.candidates(in: takeDir).map(\.lastPathComponent)
+                == ["phone.mov", "camera.mov", "camera.keep.mov"])
 
         let stretched = SceneTiming.resize(start: 2, duration: 4, delta: 6, leading: false, timeline: 26)
         expect("device scene can stretch longer", abs(stretched.duration - 10) < 0.001 && abs(stretched.start - 2) < 0.001)

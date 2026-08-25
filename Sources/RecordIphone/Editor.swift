@@ -267,20 +267,17 @@ final class EditorState: ObservableObject {
     }
 
     private func load() async {
-        let phoneSize = (try? phoneURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let cameraSize = (try? cameraURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        let sameFile = phoneURL.standardizedFileURL == cameraURL.standardizedFileURL
-        hasPhone = !sameFile && phoneSize >= 1024
+        let phoneSegments = PhoneSegments.urls(in: dir)
+        hasPhone = RecordingSourceRules.hasPhoneSource(
+            phoneURL: phoneURL, phoneSegments: phoneSegments)
+        engine.hasPhoneSource = hasPhone
         if !hasPhone {
             if cameraSize < 1024 {
                 loadFailed = "This recording looks incomplete. Try recording again."
                 return
             }
-            engine.hasPhoneSource = false
             engine.cameraEnabled = true
-        } else if phoneSize < 1024 {
-            loadFailed = "This recording looks incomplete (phone video is nearly empty). The connection may have dropped during the take."
-            return
         }
 
         // Copy live sliders into this take, then put Setup back on defaults

@@ -140,7 +140,7 @@ struct LookControls: View {
                         .buttonStyle(.plain)
                     }
                 }
-            } else if showsCamera {
+            } else if showsCamera, engine.hasPhoneSource {
                 Text("Focus").font(.system(size: 11, weight: .semibold)).foregroundStyle(Frame.secondary)
                 HStack(spacing: 6) {
                     layoutChoice("Device leads", selected: !engine.cameraLeads) {
@@ -176,7 +176,9 @@ struct LookControls: View {
                               ),
                               range: 0.02...0.22)
             } else {
-                Text(cameraStatus.layoutMessage)
+                Text(engine.hasPhoneSource
+                     ? cameraStatus.layoutMessage
+                     : "Camera-only recordings are centered automatically.")
                     .font(.system(size: 12))
                     .foregroundStyle(Frame.secondary)
                     .fixedSize(horizontal: false, vertical: true)
