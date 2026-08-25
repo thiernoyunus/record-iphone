@@ -199,12 +199,13 @@ enum WallpaperCatalog {
         let duration = duration(id: id)
         let looped = loopedTime(time, duration: duration > 0 ? duration : 20)
         let key = Int((looped * 24).rounded())
+        let generator: AVAssetImageGenerator
+        let decodeLock: NSLock
         cacheLock.lock()
-        defer { cacheLock.unlock() }
         if let hit = liveFrameCache[id]?[key] {
+            cacheLock.unlock()
             return hit
         }
-        let generator: AVAssetImageGenerator
         if let existing = generators[id] {
             generator = existing
         } else {
@@ -215,11 +216,34 @@ enum WallpaperCatalog {
             generators[id] = next
             generator = next
         }
+        if let existing = generatorLocks[id] {
+            decodeLock = existing
+        } else {
+            let next = NSLock()
+            generatorLocks[id] = next
+            decodeLock = next
+        }
+        cacheLock.unlock()
+
+        decodeLock.lock()
+        defer { decodeLock.unlock() }
+        cacheLock.lock()
+        if let hit = liveFrameCache[id]?[key] {
+            cacheLock.unlock()
+            return hit
+        }
+        cacheLock.unlock()
+
         let requested = CMTime(seconds: looped, preferredTimescale: 600)
         guard let cg = try? generator.copyCGImage(at: requested, actualTime: nil) else {
             return nil
         }
         let image = CIImage(cgImage: cg)
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        if let hit = liveFrameCache[id]?[key] {
+            return hit
+        }
         var bucket = liveFrameCache[id] ?? [:]
         if bucket.count > 48 { bucket.removeAll(keepingCapacity: true) }
         bucket[key] = image
@@ -254,5 +278,6 @@ enum WallpaperCatalog {
     private static var ciCache: [String: CIImage] = [:]
     private static var durationCache: [String: Double] = [:]
     private static var generators: [String: AVAssetImageGenerator] = [:]
+    private static var generatorLocks: [String: NSLock] = [:]
     private static var liveFrameCache: [String: [Int: CIImage]] = [:]
 }

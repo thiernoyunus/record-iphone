@@ -48,7 +48,15 @@ cp ".build/release/RecordIphone" "$APP/Contents/MacOS/Record iPhone"
 cp ".build-airplay/airplay-helper" "$APP/Contents/MacOS/airplay-helper"
 if [ -d "Sources/RecordIphone/Resources/Wallpapers" ]; then
   mkdir -p "$APP/Contents/Resources/Wallpapers"
-  cp Sources/RecordIphone/Resources/Wallpapers/*.{jpg,mp4} "$APP/Contents/Resources/Wallpapers/" 2>/dev/null || true
+  wallpaper_files=(
+    Sources/RecordIphone/Resources/Wallpapers/*.jpg(N)
+    Sources/RecordIphone/Resources/Wallpapers/*.mp4(N)
+  )
+  if (( ${#wallpaper_files} == 0 )); then
+    echo "error: no wallpaper files found" >&2
+    exit 1
+  fi
+  cp "${wallpaper_files[@]}" "$APP/Contents/Resources/Wallpapers/"
 fi
 cp Info.plist "$APP/Contents/Info.plist"
 cp PrivacyInfo.xcprivacy "$APP/Contents/Resources/PrivacyInfo.xcprivacy"

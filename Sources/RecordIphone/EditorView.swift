@@ -412,7 +412,6 @@ struct EditorView: View {
 
     private var stageFill: some View {
         CanvasBackdrop(customRGB: engine.customBackgroundRGB, preset: engine.background,
-                       wallpaperID: engine.wallpaperID,
                        time: editor.currentTime, playing: editor.isPlaying)
     }
 
