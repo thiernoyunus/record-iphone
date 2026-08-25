@@ -430,6 +430,10 @@ enum EditorLogicTests {
         expect("camera stills grow when the ruler is stretched",
                FilmstripBudget.cameraHeight(zoom: 2) > FilmstripBudget.cameraHeight(zoom: 1))
 
+        for (name, ok) in WallpaperCatalog.logicChecks() {
+            expect(name, ok)
+        }
+
         expect("zoom start snaps to quarter seconds",
                abs(ZoomSnap.snap(1.12, playhead: nil, timeline: 20) - 1.0) < 0.001)
         expect("zoom start snaps to the playhead when close",

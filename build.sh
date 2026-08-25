@@ -46,6 +46,10 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp ".build/release/RecordIphone" "$APP/Contents/MacOS/Record iPhone"
 cp ".build-airplay/airplay-helper" "$APP/Contents/MacOS/airplay-helper"
+if [ -d "Sources/RecordIphone/Resources/Wallpapers" ]; then
+  mkdir -p "$APP/Contents/Resources/Wallpapers"
+  cp Sources/RecordIphone/Resources/Wallpapers/*.{jpg,mp4} "$APP/Contents/Resources/Wallpapers/" 2>/dev/null || true
+fi
 cp Info.plist "$APP/Contents/Info.plist"
 cp PrivacyInfo.xcprivacy "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
